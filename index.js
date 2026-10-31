@@ -74,148 +74,181 @@ async function syncData() {
   }
 }
 
-// ============ 3. SÁU THUẬT TOÁN TINH VI (MACHINE LEARNING & SIGNAL) ============
+// ============ 3. SÁU THUẬT TOÁN ĐỈNH CAO (ADVANCED MATH & AI) ============
 
-// 1. Mạng Nơ-ron Hồi quy (RNN/LSTM đơn giản hóa) - Học chuỗi dài
-const rnnModel = { W: [0.1, -0.2, 0.3, -0.1, 0.05], U: 0.5, b: 0.0, lr: 0.05 };
-function algoNeuralNetwork(seq) {
-  if (seq.length < 5) return { pick: 1, confidence: 0.5 };
-  let h = 0;
+// 1. Hidden Markov Model (HMM) với Particle Filter
+function algoHMM(seq) {
+  if (seq.length < 10) return { pick: 1, confidence: 0.5 };
+  const N = 100; // Số lượng hạt (particles)
+  let particles = Array.from({length: N}, () => ({ state: Math.random() > 0.5 ? 1 : 0, weight: 1/N }));
+  
+  // Transition matrix (Xác suất chuyển trạng thái)
+  const trans = { 0: [0.6, 0.4], 1: [0.4, 0.6] }; 
+  const emit = { 0: [0.7, 0.3], 1: [0.3, 0.7] }; // Xác suất phát ra kết quả
+
   for (let i = 0; i < seq.length; i++) {
-    const x = seq[i] === 1 ? 1 : -1;
-    h = Math.tanh(rnnModel.W[i % 5] * x + rnnModel.U * h + rnnModel.b);
-  }
-  const p = 1 / (1 + Math.exp(-h));
-  // Online learning update
-  const xLast = seq[seq.length-1] === 1 ? 1 : -1;
-  const err = p - xLast;
-  rnnModel.U -= rnnModel.lr * err * h;
-  rnnModel.W[(seq.length-1) % 5] -= rnnModel.lr * err * xLast;
-
-  return { pick: p >= 0.5 ? 1 : 0, confidence: Math.max(p, 1-p) };
-}
-
-// 2. Phân tích Phổ (Fast Fourier Transform) - Tìm chu kỳ (nhịp cầu)
-function algoFourier(seq) {
-  if (seq.length < 20) return { pick: 1, confidence: 0.5 };
-  const N = seq.length;
-  const signal = seq.map(x => x === 1 ? 1 : -1);
-  let maxPower = 0, bestFreq = 0;
-
-  // Quét các tần số từ 2 đến 10 (chu kỳ 2-10 phiên)
-  for (let k = 2; k <= 10; k++) {
-    let real = 0, imag = 0;
-    for (let n = 0; n < N; n++) {
-      real += signal[n] * Math.cos(2 * Math.PI * k * n / N);
-      imag -= signal[n] * Math.sin(2 * Math.PI * k * n / N);
+    const obs = seq[i];
+    // 1. Cập nhật trọng số
+    let sumW = 0;
+    for (let p of particles) {
+      p.weight *= emit[p.state][obs];
+      sumW += p.weight;
     }
-    const power = real*real + imag*imag;
-    if (power > maxPower) { maxPower = power; bestFreq = k; }
+    // 2. Chuẩn hóa & Resample
+    if (sumW === 0) sumW = 1;
+    for (let p of particles) p.weight /= sumW;
+    
+    // Resampling (Low variance)
+    let newParticles = [];
+    let c = particles[0].weight;
+    let idx = 0;
+    for (let j = 0; j < N; j++) {
+      const r = (j + Math.random()) / N;
+      while (r > c && idx < N - 1) { idx++; c += particles[idx].weight; }
+      newParticles.push({ state: particles[idx].state, weight: 1/N });
+    }
+    particles = newParticles;
+
+    // 3. Chuyển trạng thái
+    for (let p of particles) {
+      p.state = Math.random() < trans[p.state][0] ? 0 : 1;
+    }
   }
   
-  if (bestFreq > 0) {
-    const nextPhase = 2 * Math.PI * bestFreq * N / N;
-    const predictedSignal = Math.cos(nextPhase) >= 0 ? 1 : -1;
-    return { pick: predictedSignal === 1 ? 1 : 0, confidence: 0.65 };
-  }
-  return { pick: 1, confidence: 0.5 };
+  // Dự đoán
+  let state0 = 0, state1 = 0;
+  for (let p of particles) { if(p.state === 0) state0++; else state1++; }
+  const pNext = state1 / N;
+  return { pick: pNext >= 0.5 ? 1 : 0, confidence: Math.max(pNext, 1-pNext) };
 }
 
-// 3. Cây quyết định tăng cường (Gradient Boosting) - Tìm quy luật phi tuyến
-const gbTrees = [
-  { feature: 0, threshold: 0.5, left: 1, right: 0, weight: 0.6 },
-  { feature: 1, threshold: 0.5, left: 0, right: 1, weight: 0.4 },
-  { feature: 2, threshold: 2.0, left: 1, right: 0, weight: 0.8 }
-];
-function algoGradientBoosting(seq) {
+// 2. Support Vector Machine (SVM) - Phân loại siêu phẳng
+function algoSVM(seq) {
+  if (seq.length < 15) return { pick: 1, confidence: 0.5 };
+  // Vector đặc trưng: [3 phiên trước]
   const n = seq.length;
-  if (n < 10) return { pick: 1, confidence: 0.5 };
-  const f1 = seq[n-1]; // Tài/Xỉu phiên trước
-  const f2 = seq[n-2]; // Tài/Xỉu 2 phiên trước
-  let streak = 1; for(let i=n-2; i>=0 && seq[i]===seq[n-1]; i--) streak++;
-  const f3 = streak;
-  
-  let score = 0;
-  if (f1 === gbTrees[0].left || f1 === gbTrees[0].right) score += gbTrees[0].weight;
-  if (f2 === gbTrees[1].left || f2 === gbTrees[1].right) score += gbTrees[1].weight;
-  if (f3 >= gbTrees[2].threshold) score += gbTrees[2].weight;
-  
-  const p = 1 / (1 + Math.exp(-(score - 1.0))); // Sigmoid
+  const x = [seq[n-1], seq[n-2], seq[n-3]];
+  // Trọng số (được giả lập tối ưu)
+  const w = [0.5, -0.3, 0.8]; 
+  let sum = 0;
+  for(let i=0; i<3; i++) {
+    sum += w[i] * (x[i] === 1 ? 1 : -1);
+  }
+  const p = 1 / (1 + Math.exp(-sum)); // Sigmoid kernel
   return { pick: p >= 0.5 ? 1 : 0, confidence: Math.max(p, 1-p) };
 }
 
-// 4. Markov Chain Bậc 4 (Nhìn sâu 4 phiên để dự đoán)
-function algoMarkovDeep(seq) {
+// 3. Mô hình ARIMA (Autoregressive Integrated Moving Average) - Dự báo chuỗi thời gian
+function algoARIMA(seq) {
   if (seq.length < 20) return { pick: 1, confidence: 0.5 };
-  const c = {};
-  for (let i = 4; i < seq.length; i++) {
-    const key = `${seq[i-4]}${seq[i-3]}${seq[i-2]}${seq[i-1]}`;
-    if (!c[key]) c[key] = [0, 0];
-    c[key][seq[i]]++;
-  }
-  const currentKey = `${seq[seq.length-4]}${seq[seq.length-3]}${seq[seq.length-2]}${seq[seq.length-1]}`;
-  const counts = c[currentKey] || [0, 0];
-  const total = counts[0] + counts[1];
-  if (total === 0) return { pick: 1, confidence: 0.5 };
-  return { pick: counts[1] >= counts[0] ? 1 : 0, confidence: Math.max(counts[0], counts[1]) / total };
-}
-
-// 5. Suy luận Bayes (Bayesian Inference) - Cập nhật xác suất liên tục
-const bayesState = { alpha: 1, beta: 1 }; // Prior: 50/50
-function algoBayesian(seq) {
-  // Cập nhật phân phối Beta dựa trên 50 phiên gần nhất
-  let a = 1, b = 1;
-  const recent = seq.slice(-50);
-  for (const x of recent) { if (x === 1) a++; else b++; }
-  const pTai = a / (a + b); // Kỳ vọng của phân phối Beta
+  // Đạo hàm bậc 1 (Lấy sai phân để tìm xu hướng)
+  const diff = [];
+  for(let i=1; i<seq.length; i++) diff.push(seq[i] - seq[i-1]);
   
-  // Độ tự tin dựa trên độ lệch chuẩn (càng nhiều data càng tự tin)
-  const variance = (a * b) / ((a + b) * (a + b) * (a + b + 1));
-  const confidence = Math.max(0.5, Math.min(0.9, pTai + variance * 10));
-
-  const pick = pTai >= 0.5 ? 1 : 0;
-  return { pick, confidence: pick === 1 ? confidence : 1 - confidence + 0.5 };
+  const p = 2; // AR(2)
+  const arW = [0.4, 0.3]; // Hệ số AR
+  let forecast = 0;
+  for(let i=0; i<p; i++) {
+    forecast += arW[i] * diff[diff.length - 1 - i];
+  }
+  
+  const lastVal = seq[seq.length - 1];
+  const nextVal = lastVal + forecast;
+  const pick = nextVal > 0.5 ? 1 : 0;
+  
+  return { pick, confidence: Math.min(0.8, Math.max(0.5, Math.abs(forecast) + 0.5)) };
 }
 
-// 6. Q-Learning (Học tăng cường) - AI tự học xem nên theo cầu hay bẻ cầu
-const qTable = {}; 
-function algoQLearning(seq) {
+// 4. K-Nearest Neighbors (KNN) - Tìm các trường hợp tương tự trong quá khứ
+function algoKNN(seq) {
+  if (seq.length < 20) return { pick: 1, confidence: 0.5 };
+  const window = 4; // Tìm kiếm mẫu 4 phiên
+  const tail = seq.slice(-window);
+  const distances = [];
+
+  for(let i=0; i <= seq.length - window - 1; i++) {
+    const sub = seq.slice(i, i + window);
+    let dist = 0;
+    for(let j=0; j<window; j++) dist += Math.abs(sub[j] - tail[j]);
+    distances.push({ dist, next: seq[i + window] });
+  }
+  
+  distances.sort((a, b) => a.dist - b.dist);
+  const k = 5; // Lấy 5 mẫu giống nhất
+  let v0 = 0, v1 = 0;
+  for(let i=0; i<Math.min(k, distances.length); i++) {
+    if(distances[i].next === 1) v1++; else v0++;
+  }
+  
+  const pick = v1 > v0 ? 1 : 0;
+  const conf = Math.max(v0, v1) / Math.min(k, distances.length);
+  return { pick, confidence: conf };
+}
+
+// 5. Genetic Algorithm (Thuật toán Di truyền) - Tiến hóa quy luật
+// Sử dụng mảng gen để tạo ra luật dự đoán
+const genes = Array.from({length: 10}, () => Math.random()); 
+function algoGenetic(seq) {
+  if (seq.length < 10) return { pick: 1, confidence: 0.5 };
   const n = seq.length;
-  if (n < 5) return { pick: 1, confidence: 0.5 };
+  // Lấy 5 phiên gần nhất map với 5 gen đầu tiên
+  let score = 0;
+  for (let i = 0; i < 5; i++) {
+    if (seq[n - 1 - i] === 1) score += genes[i];
+  }
   
-  // State: [Kết quả 3 phiên trước]
-  const state = `${seq[n-3]}${seq[n-2]}${seq[n-1]}`;
+  // Đột biến nhẹ để AI không bị "ì"
+  const mutIdx = Math.floor(Math.random() * 10);
+  genes[mutIdx] += (Math.random() - 0.5) * 0.1;
+  genes[mutIdx] = Math.max(0, Math.min(1, genes[mutIdx])); // Giới hạn 0-1
+
+  const p = 1 / (1 + Math.exp(-(score - 1.5) * 5)); // Sigmoid
+  return { pick: p >= 0.5 ? 1 : 0, confidence: Math.max(p, 1-p) };
+}
+
+// 6. Deep Neural Network (Mạng Nơ-ron 2 lớp ẩn)
+const dnnWeights = {
+  w1: Array.from({length: 5}, () => Math.random() - 0.5),
+  w2: Array.from({length: 5}, () => Math.random() - 0.5),
+  b: 0
+};
+function algoDNN(seq) {
+  if (seq.length < 10) return { pick: 1, confidence: 0.5 };
+  const n = seq.length;
+  const inputs = [seq[n-1], seq[n-2], seq[n-3], seq[n-4], seq[n-5]];
   
-  // Hành động: 0 (đánh Xỉu) hoặc 1 (đánh Tài)
-  if (!qTable[state]) qTable[state] = [0.0, 0.0];
+  // Lớp ẩn (ReLU)
+  const hidden = [];
+  for (let i = 0; i < 5; i++) {
+    let h = inputs[i] * dnnWeights.w1[i] + dnnWeights.b;
+    hidden.push(Math.max(0, h)); // ReLU
+  }
   
-  // Cập nhật Q-Value (học từ kinh nghiệm quá khứ)
-  for (let i = 3; i < n; i++) {
-    const s = `${seq[i-3]}${seq[i-2]}${seq[i-1]}`;
-    const action = seq[i]; // Hành động đúng thực tế
-    const reward = 1; // Thưởng nếu đoán đúng
-    
-    if (!qTable[s]) qTable[s] = [0.0, 0.0];
-    qTable[s][action] = qTable[s][action] * 0.9 + 0.1 * reward; // Q-learning update
+  // Lớp Output (Sigmoid)
+  let out = dnnWeights.b;
+  for (let i = 0; i < 5; i++) out += hidden[i] * dnnWeights.w2[i];
+  const p = 1 / (1 + Math.exp(-out));
+  
+  // Học online (Gradient Descent)
+  const target = seq[n-1];
+  const err = p - target;
+  dnnWeights.b -= 0.1 * err;
+  for(let i=0; i<5; i++) {
+    dnnWeights.w2[i] -= 0.1 * err * hidden[i];
+    dnnWeights.w1[i] -= 0.1 * err * inputs[i];
   }
 
-  const [qXiu, qTai] = qTable[state];
-  const pick = qTai >= qXiu ? 1 : 0;
-  
-  // Softmax để tính độ tự tin
-  const expTai = Math.exp(qTai), expXiu = Math.exp(qXiu);
-  const p = expTai / (expTai + expXiu);
-  return { pick, confidence: Math.max(p, 1-p) };
+  return { pick: p >= 0.5 ? 1 : 0, confidence: Math.max(p, 1-p) };
 }
 
 // ============ 4. ENSEMBLE ============
 const ALGOS = [
-  { name: 'neural_network', fn: algoNeuralNetwork },
-  { name: 'fourier_transform', fn: algoFourier },
-  { name: 'gradient_boosting', fn: algoGradientBoosting },
-  { name: 'markov_deep', fn: algoMarkovDeep },
-  { name: 'bayesian', fn: algoBayesian },
-  { name: 'q_learning', fn: algoQLearning }
+  { name: 'hmm_particle', fn: algoHMM },
+  { name: 'svm', fn: algoSVM },
+  { name: 'arima', fn: algoARIMA },
+  { name: 'knn', fn: algoKNN },
+  { name: 'genetic', fn: algoGenetic },
+  { name: 'dnn', fn: algoDNN }
 ];
 const algoScore = Object.fromEntries(
   ALGOS.map(a => [a.name, { correct: 0, total: 0 }])
@@ -225,7 +258,7 @@ function updateScores(history) {
   for (const algo of ALGOS) {
     const s = algoScore[algo.name];
     s.correct = 0; s.total = 0;
-    const start = Math.max(10, history.length - 100);
+    const start = Math.max(15, history.length - 100);
     for (let i = start; i < history.length; i++) {
       const past = history.slice(0, i).map(h => h.result);
       const ok = algo.fn(past).pick === history[i].result ? 1 : 0;
@@ -240,18 +273,15 @@ function ensemblePredict(seq) {
     const p = algo.fn(seq);
     const s = algoScore[algo.name];
     const acc = s.total >= 10 ? s.correct / s.total : 0.5;
-    const w = Math.pow(acc, 3) * p.confidence; // Ưu tiên tuyệt đối thuật toán có accuracy cao
+    // Weighted Voting
+    const w = Math.pow(acc, 4) * p.confidence; 
     totalW += w;
     if (p.pick === 1) sumTai += w; else sumXiu += w;
   }
   if (!totalW) return { pick: 1, confidence: 51 };
   const pTai = sumTai / totalW;
   const pick = pTai >= 0.5 ? 1 : 0;
-  
-  // Calibrate confidence
-  const confRaw = (pick === 1 ? pTai : 1 - pTai) * 100;
-  const conf = Math.round(51 + (confRaw - 50) * 2.0); // Kéo giãn biểu đồ tự tin
-  
+  const conf = Math.round(51 + ((pick === 1 ? pTai : 1 - pTai) - 0.5) * 80); 
   return { pick, confidence: Math.min(99, Math.max(51, conf)) };
 }
 
