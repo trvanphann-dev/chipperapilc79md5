@@ -1,0 +1,3 @@
+node_modules/
+lichsulc79md5.json
+.env
