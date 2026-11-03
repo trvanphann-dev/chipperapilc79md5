@@ -1,3 +1,4 @@
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -6,10 +7,12 @@ const app = express();
 app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
+const MODEL_FILE = path.join(__dirname, 'model_taixiu.json');
 const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 const POLL_INTERVAL = 15000;
 
 // ============ 1. FILE ============
+
 function initDataFile() {
   fs.writeFileSync(DATA_FILE, '[]', 'utf8');
   console.log('[INIT] Đã xoá & tạo mới lichsulc79md5.json');
@@ -28,6 +31,7 @@ function writeHistory(arr) {
 }
 
 // ============ 2. SYNC ============
+
 async function fetchSource() {
   const res = await fetch(SOURCE_API, {
     headers: {
@@ -115,6 +119,9 @@ async function syncData() {
         knownIds.has(s.id)
       ) continue;
 
+      // Chấm dự đoán đã lưu trước khi thêm kết quả mới.
+      settlePrediction(s.id, s.result);
+
       history.push(s);
       knownIds.add(s.id);
       added++;
@@ -134,7 +141,59 @@ async function syncData() {
   }
 }
 
-// ============ 3. STATISTICAL FUNCTIONS ============
+// ============ 3. MODEL STORAGE ============
+
+function defaultModel() {
+  return {
+    weights: [1, 1, 1, 1, 1],
+    logistic: [0, 0, 0, 0, 0],
+    pending: {},
+    updates: 0
+  };
+}
+
+function initModelFile() {
+  if (!fs.existsSync(MODEL_FILE)) {
+    fs.writeFileSync(
+      MODEL_FILE,
+      JSON.stringify(defaultModel(), null, 2),
+      'utf8'
+    );
+  }
+}
+
+function readModel() {
+  try {
+    const model = JSON.parse(
+      fs.readFileSync(MODEL_FILE, 'utf8')
+    );
+
+    if (
+      !Array.isArray(model.weights) ||
+      model.weights.length !== 5 ||
+      !Array.isArray(model.logistic) ||
+      model.logistic.length !== 5 ||
+      !model.pending ||
+      typeof model.pending !== 'object'
+    ) {
+      return defaultModel();
+    }
+
+    return model;
+  } catch {
+    return defaultModel();
+  }
+}
+
+function writeModel(model) {
+  fs.writeFileSync(
+    MODEL_FILE,
+    JSON.stringify(model, null, 2),
+    'utf8'
+  );
+}
+
+// ============ 4. STATISTICAL FUNCTIONS ============
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -147,57 +206,125 @@ function getRate(seq) {
 
   if (!valid.length) return 0.5;
 
-  const tai = valid.reduce((sum, value) => sum + value, 0);
-
-  return tai / valid.length;
+  return valid.reduce((sum, value) => sum + value, 0) /
+    valid.length;
 }
 
-function makePrediction(pTai, strength = 0) {
-  const p = clamp(pTai, 0, 1);
+function sigmoid(value) {
+  const x = clamp(value, -20, 20);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function logLoss(probability, actual) {
+  const p = clamp(probability, 0.001, 0.999);
+
+  return -(
+    actual * Math.log(p) +
+    (1 - actual) * Math.log(1 - p)
+  );
+}
+
+function makePrediction(pTai) {
+  const p = clamp(pTai, 0.001, 0.999);
 
   return {
     pick: p > 0.5 ? 1 : 0,
-    pTai: p,
-    strength: clamp(strength, 0, 1)
+    pTai: p
   };
 }
 
-// ============ 4. ALGORITHM 1: BAYESIAN BASE RATE ============
+// ============ 5. SHARED FEATURES ============
 
-function algoBayesian(seq) {
+function calculateFeatures(seq) {
   const n = seq.length;
 
-  if (n === 0) return makePrediction(0.5);
+  const globalRate = getRate(seq);
+
+  const recentSize = Math.min(20, n);
+  const recent = seq.slice(-recentSize);
+  const recentRate = getRate(recent);
+
+  // EWMA
+  const alpha = 0.15;
+  let ewma = globalRate;
+
+  for (const value of seq) {
+    ewma = alpha * value + (1 - alpha) * ewma;
+  }
+
+  // Markov transition probability
+  const current = seq[n - 1];
+
+  let transitionTai = 0;
+  let transitionTotal = 0;
+
+  for (let i = 1; i < n; i++) {
+    if (seq[i - 1] !== current) continue;
+
+    transitionTotal++;
+
+    if (seq[i] === 1) {
+      transitionTai++;
+    }
+  }
+
+  const markovRate = transitionTotal > 0
+    ? (
+        transitionTai + globalRate * 10
+      ) / (
+        transitionTotal + 10
+      )
+    : globalRate;
+
+  // Các đặc trưng được chuẩn hóa quanh tỷ lệ tổng thể.
+  return {
+    globalRate,
+    recentRate,
+    ewma,
+    markovRate,
+    logistic: [
+      1,
+      globalRate - 0.5,
+      recentRate - globalRate,
+      ewma - globalRate,
+      markovRate - globalRate
+    ]
+  };
+}
+
+// ============ 6. ALGORITHM 1: BAYESIAN ADAPTIVE ============
+
+function algoBayesian(seq, features) {
+  const n = seq.length;
+
+  if (!n) return makePrediction(0.5);
 
   const tai = seq.reduce((sum, value) => sum + value, 0);
+  const xiu = n - tai;
 
-  // Prior đối xứng, không thiên vị Tài/Xỉu.
+  // Prior Beta đối xứng.
   const alpha = 2;
   const beta = 2;
 
-  const pTai = (tai + alpha) / (n + alpha + beta);
+  const pTai = (tai + alpha) /
+    (tai + xiu + alpha + beta);
 
-  const strength = Math.abs(pTai - 0.5) * 2;
-
-  return makePrediction(pTai, strength);
+  return makePrediction(pTai);
 }
 
-// ============ 5. ALGORITHM 2: MARKOV TRANSITION ============
+// ============ 7. ALGORITHM 2: MARKOV ============
 
-function algoMarkov(seq) {
-  const n = seq.length;
+function algoMarkov(seq, features) {
+  if (seq.length < 2) {
+    return makePrediction(features.globalRate);
+  }
 
-  if (n < 2) return makePrediction(0.5);
-
-  const current = seq[n - 1];
-
-  const globalRate = getRate(seq);
+  const current = seq[seq.length - 1];
 
   let tai = 0;
   let total = 0;
 
-  // Đếm xác suất kết quả tiếp theo sau trạng thái hiện tại.
-  for (let i = 1; i < n; i++) {
+  for (let i = 1; i < seq.length; i++) {
     if (seq[i - 1] !== current) continue;
 
     total++;
@@ -205,153 +332,229 @@ function algoMarkov(seq) {
     if (seq[i] === 1) tai++;
   }
 
-  if (total === 0) {
-    return makePrediction(globalRate);
-  }
-
-  // Co xác suất về tỷ lệ tổng thể để tránh mẫu nhỏ gây lệch.
-  const priorWeight = 8;
+  // Co xác suất về tỷ lệ chung để tránh mẫu nhỏ.
+  const priorWeight = 12;
 
   const pTai = (
-    tai + globalRate * priorWeight
+    tai + features.globalRate * priorWeight
   ) / (
     total + priorWeight
   );
 
-  const strength = (
-    Math.abs(pTai - globalRate) * 2
-  ) * (
-    total / (total + priorWeight)
-  );
-
-  return makePrediction(pTai, strength);
+  return makePrediction(pTai);
 }
 
-// ============ 6. ALGORITHM 3: RECENT WINDOW ============
+// ============ 8. ALGORITHM 3: REGIME ADAPTIVE ============
 
-function algoRecent(seq) {
+function algoRegime(seq, features) {
   const n = seq.length;
 
-  if (n < 5) return makePrediction(0.5);
-
-  const windowSize = Math.min(30, n);
-
-  const recent = seq.slice(-windowSize);
-
-  const globalRate = getRate(seq);
-
-  const tai = recent.reduce((sum, value) => sum + value, 0);
-
-  // Làm trơn dữ liệu ngắn hạn bằng tỷ lệ tổng thể.
-  const priorWeight = 10;
-
-  const pTai = (
-    tai + globalRate * priorWeight
-  ) / (
-    recent.length + priorWeight
-  );
-
-  const strength = (
-    Math.abs(pTai - globalRate) * 2
-  ) * (
-    recent.length / (recent.length + priorWeight)
-  );
-
-  return makePrediction(pTai, strength);
-}
-
-// ============ 7. ALGORITHM 4: EWMA ============
-
-function algoEWMA(seq) {
-  const n = seq.length;
-
-  if (n < 5) return makePrediction(0.5);
-
-  const globalRate = getRate(seq);
-
-  const alpha = 0.15;
-
-  let average = globalRate;
-
-  for (let i = 0; i < n; i++) {
-    average =
-      alpha * seq[i] +
-      (1 - alpha) * average;
+  if (n < 10) {
+    return makePrediction(features.globalRate);
   }
 
-  // Không để EWMA ngắn hạn lấn át tỷ lệ tổng thể.
-  const blend = 0.30;
-
-  const pTai = (
-    globalRate * (1 - blend) +
-    average * blend
-  );
-
-  const strength = Math.abs(
-    pTai - globalRate
-  ) * 2;
-
-  return makePrediction(pTai, strength);
-}
-
-// ============ 8. ALGORITHM 5: MOMENTUM ============
-
-function algoMomentum(seq) {
-  const n = seq.length;
-
-  if (n < 20) return makePrediction(0.5);
-
-  const globalRate = getRate(seq);
-
-  const recentSize = Math.min(10, n);
-  const previousSize = Math.min(30, n - recentSize);
-
+  const recentSize = Math.min(20, n);
   const recent = seq.slice(-recentSize);
 
-  const previous = seq.slice(
-    -(recentSize + previousSize),
-    -recentSize
-  );
-
-  if (!previous.length) {
-    return makePrediction(globalRate);
-  }
+  const olderEnd = n - recentSize;
+  const olderStart = Math.max(0, olderEnd - 100);
+  const older = seq.slice(olderStart, olderEnd);
 
   const recentRate = getRate(recent);
-  const previousRate = getRate(previous);
 
-  // Chỉ sử dụng một phần rất nhỏ chênh lệch ngắn hạn.
-  // Không giả định xu hướng sẽ tiếp tục vô hạn.
-  const adjustment = (
-    recentRate - previousRate
-  ) * 0.10;
+  const olderRate = older.length
+    ? getRate(older)
+    : features.globalRate;
+
+  // Đo độ thay đổi giữa giai đoạn gần và giai đoạn trước.
+  const difference = recentRate - olderRate;
+
+  // Mức thích nghi phụ thuộc lượng dữ liệu, không phụ thuộc random.
+  const reliability = recent.length /
+    (recent.length + 20);
+
+  const adjustment = difference * reliability * 0.5;
 
   const pTai = clamp(
-    globalRate + adjustment,
+    features.globalRate + adjustment,
     0.05,
     0.95
   );
 
-  const strength = Math.abs(
-    adjustment
-  ) * 2;
-
-  return makePrediction(pTai, strength);
+  return makePrediction(pTai);
 }
 
-// ============ 9. FIVE ALGORITHMS ============
+// ============ 9. ALGORITHM 4: EWMA ADAPTIVE ============
+
+function algoEWMA(seq, features) {
+  if (seq.length < 3) {
+    return makePrediction(features.globalRate);
+  }
+
+  let average = features.globalRate;
+
+  const alpha = 0.12;
+
+  for (const value of seq) {
+    average =
+      alpha * value +
+      (1 - alpha) * average;
+  }
+
+  // Giới hạn ảnh hưởng ngắn hạn.
+  const pTai =
+    features.globalRate * 0.65 +
+    average * 0.35;
+
+  return makePrediction(pTai);
+}
+
+// ============ 10. ALGORITHM 5: ONLINE LOGISTIC ============
+
+function algoOnlineLogistic(seq, features, model) {
+  if (seq.length < 10) {
+    return makePrediction(features.globalRate);
+  }
+
+  const coefficients = model.logistic;
+
+  let score = 0;
+
+  for (let i = 0; i < coefficients.length; i++) {
+    score += coefficients[i] * features.logistic[i];
+  }
+
+  const pTai = sigmoid(score);
+
+  return makePrediction(pTai);
+}
+
+// ============ 11. FIVE ALGORITHMS ============
 
 const ALGOS = [
   { name: 'bayesian', fn: algoBayesian },
-  { name: 'markov_transition', fn: algoMarkov },
-  { name: 'recent_window', fn: algoRecent },
-  { name: 'ewma', fn: algoEWMA },
-  { name: 'momentum', fn: algoMomentum }
+  { name: 'markov', fn: algoMarkov },
+  { name: 'regime_adaptive', fn: algoRegime },
+  { name: 'ewma_adaptive', fn: algoEWMA },
+  { name: 'online_logistic', fn: algoOnlineLogistic }
 ];
 
-// ============ 10. ENSEMBLE ============
+function runAlgorithms(seq, model) {
+  const features = calculateFeatures(seq);
 
-function ensemblePredict(seq) {
+  const predictions = ALGOS.map(algo => {
+    return algo.fn(seq, features, model);
+  });
+
+  return {
+    features,
+    predictions
+  };
+}
+
+// ============ 12. ADAPTIVE WEIGHT LEARNING ============
+
+function normalizeWeights(weights) {
+  const safe = weights.map(w => clamp(
+    Number.isFinite(w) ? w : 1,
+    0.2,
+    5
+  ));
+
+  const total = safe.reduce((sum, value) => sum + value, 0);
+
+  if (total <= 0) return [1, 1, 1, 1, 1];
+
+  // Tổng trọng số được chuẩn hóa bằng 5.
+  return safe.map(w => w * 5 / total);
+}
+
+function settlePrediction(sessionId, actual) {
+  const model = readModel();
+
+  const key = String(sessionId);
+  const pending = model.pending[key];
+
+  if (!pending) return;
+
+  if (
+    !Array.isArray(pending.probabilities) ||
+    pending.probabilities.length !== 5
+  ) {
+    delete model.pending[key];
+    writeModel(model);
+    return;
+  }
+
+  const losses = pending.probabilities.map(p => {
+    return logLoss(p, actual);
+  });
+
+  const averageLoss = losses.reduce(
+    (sum, value) => sum + value,
+    0
+  ) / losses.length;
+
+  // Thuật toán có Log Loss thấp hơn trung bình được tăng trọng số.
+  const learningRate = 0.35;
+
+  for (let i = 0; i < model.weights.length; i++) {
+    const improvement = averageLoss - losses[i];
+
+    model.weights[i] *= Math.exp(
+      learningRate * improvement
+    );
+  }
+
+  model.weights = normalizeWeights(model.weights);
+
+  // Cập nhật hệ số Logistic bằng gradient descent.
+  if (
+    Array.isArray(pending.features) &&
+    pending.features.length === 5
+  ) {
+    const coefficients = model.logistic;
+
+    const oldScore = coefficients.reduce(
+      (sum, coefficient, i) =>
+        sum + coefficient * pending.features[i],
+      0
+    );
+
+    const predicted = sigmoid(oldScore);
+
+    const error = actual - predicted;
+
+    const logisticRate = 0.04;
+
+    for (let i = 0; i < coefficients.length; i++) {
+      coefficients[i] +=
+        logisticRate * error * pending.features[i];
+
+      coefficients[i] = clamp(
+        coefficients[i],
+        -5,
+        5
+      );
+    }
+  }
+
+  model.updates = (model.updates || 0) + 1;
+
+  delete model.pending[key];
+
+  writeModel(model);
+
+  console.log(
+    `[LEARN] Phiên ${sessionId} | Kết quả ${actual === 1 ? 'TAI' : 'XIU'} | Updates ${model.updates}`
+  );
+}
+
+// ============ 13. ENSEMBLE ============
+
+function ensemblePredict(seq, targetSessionId) {
+  const model = readModel();
+
   if (seq.length < 10) {
     return {
       pick: 0,
@@ -360,18 +563,11 @@ function ensemblePredict(seq) {
     };
   }
 
-  const predictions = ALGOS.map(algo => {
-    return algo.fn(seq);
-  });
+  const result = runAlgorithms(seq, model);
 
-  // Trọng số giảm ảnh hưởng của các tín hiệu ngắn hạn.
-  const weights = [
-    0.30,
-    0.25,
-    0.20,
-    0.15,
-    0.10
-  ];
+  const predictions = result.predictions;
+
+  const weights = normalizeWeights(model.weights);
 
   let weightedTai = 0;
   let totalWeight = 0;
@@ -381,50 +577,71 @@ function ensemblePredict(seq) {
     totalWeight += weights[i];
   }
 
-  let pTai = weightedTai / totalWeight;
-
-  // Giới hạn độ lệch để tránh dự đoán quá tự tin.
-  pTai = clamp(pTai, 0.20, 0.80);
-
-  // Nếu xác suất gần 50/50 thì xem là tín hiệu yếu.
-  const distance = Math.abs(pTai - 0.5);
-
-  // Điểm tin cậy thận trọng, không phải xác suất thắng.
-  const confidence = 50 + Math.min(
-    5,
-    distance * 20
+  const pTai = clamp(
+    weightedTai / totalWeight,
+    0.001,
+    0.999
   );
 
+  // Độ tin cậy tăng rất chậm theo độ mạnh tín hiệu
+  // và số lần học thực tế.
+  const signalStrength = Math.abs(pTai - 0.5) * 2;
+
+  const learningReliability =
+    model.updates / (model.updates + 30);
+
+  const confidence = 50 +
+    signalStrength * 10 * learningReliability;
+
   const pick = pTai > 0.5 ? 1 : 0;
+
+  // Chỉ lưu dự đoán đầu tiên cho mỗi phiên mục tiêu.
+  // Không ghi đè dự đoán cũ khi API được gọi nhiều lần.
+  if (targetSessionId !== undefined) {
+    const key = String(targetSessionId);
+
+    if (!model.pending[key]) {
+      model.pending[key] = {
+        probabilities: predictions.map(p => p.pTai),
+        features: result.features.logistic,
+        ensembleProbability: pTai,
+        createdAt: Date.now()
+      };
+
+      // Giới hạn số dự đoán chờ kết quả.
+      const keys = Object.keys(model.pending);
+
+      if (keys.length > 100) {
+        keys
+          .sort((a, b) => Number(a) - Number(b))
+          .slice(0, keys.length - 100)
+          .forEach(oldKey => {
+            delete model.pending[oldKey];
+          });
+      }
+
+      writeModel(model);
+    }
+  }
 
   return {
     pick,
 
     confidence: Math.round(
-      confidence * 100
+      clamp(confidence, 50, 60) * 100
     ) / 100,
 
-    pTai: Math.round(
-      pTai * 10000
-    ) / 10000,
+    pTai: Math.round(pTai * 10000) / 10000,
 
-    algorithms: ALGOS.map((algo, index) => ({
-      name: algo.name,
+    weights: weights.map(w =>
+      Math.round(w * 1000) / 1000
+    ),
 
-      pick: predictions[index].pick,
-
-      probabilityTai: Math.round(
-        predictions[index].pTai * 10000
-      ) / 10000,
-
-      strength: Math.round(
-        predictions[index].strength * 10000
-      ) / 10000
-    }))
+    updates: model.updates
   };
 }
 
-// ============ 11. TIME VN ============
+// ============ 14. TIME VN ============
 
 function formatTimeVN() {
   const now = new Date(Date.now() + 7 * 3600 * 1000);
@@ -432,7 +649,7 @@ function formatTimeVN() {
   return now.toISOString().replace('Z', '+07:00');
 }
 
-// ============ 12. RESPONSE ============
+// ============ 15. RESPONSE ============
 
 function buildResponse() {
   const history = readHistory();
@@ -449,7 +666,9 @@ function buildResponse() {
 
   const seq = history.map(h => h.result);
 
-  const ens = ensemblePredict(seq);
+  const nextSessionId = current.id + 1;
+
+  const ens = ensemblePredict(seq, nextSessionId);
 
   return {
     "id": "noname09",
@@ -457,14 +676,14 @@ function buildResponse() {
     "ketqua": current.result === 1 ? "tai" : "xiu",
     "xucxac": current.dices,
     "tong": current.sum,
-    "dudoanphien": current.id + 1,
+    "dudoanphien": nextSessionId,
     "dudoan": ens.pick === 1 ? "tai" : "xiu",
     "dotincay": `${ens.confidence}%`,
     "uptime": formatTimeVN()
   };
 }
 
-// ============ 13. ROUTES ============
+// ============ 16. ROUTES ============
 
 app.get('/', (req, res) => res.json(buildResponse()));
 
@@ -481,9 +700,10 @@ app.get('/history', (req, res) => {
   });
 });
 
-// ============ 14. BOOT ============
+// ============ 17. BOOT ============
 
 initDataFile();
+initModelFile();
 
 syncData();
 
