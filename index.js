@@ -1,4 +1,3 @@
-
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -46,17 +45,46 @@ async function fetchSource() {
 
 function normalizeSession(raw) {
   const id = raw.id ?? raw.session ?? raw.issue;
-  const dices = raw.dices ?? raw.dice ?? raw.result ?? [];
 
-  const sum = Array.isArray(dices)
-    ? dices.reduce((a, b) => a + Number(b), 0)
+  const rawDices = raw.dices ?? raw.dice ??
+    (Array.isArray(raw.result) ? raw.result : []);
+
+  const dices = Array.isArray(rawDices)
+    ? rawDices.map(Number)
+    : [];
+
+  const sum = dices.length
+    ? dices.reduce((a, b) => a + b, 0)
     : Number(raw.sum ?? 0);
 
-  const result = sum >= 11 ? 1 : 0;
+  const sourceResult = String(
+    raw.resultTruyenThong ??
+    raw.bigSmall ??
+    raw.result ??
+    ''
+  ).trim().toUpperCase();
+
+  let result;
+
+  if (
+    sourceResult === 'TAI' ||
+    sourceResult === 'TÀI' ||
+    sourceResult === 'BIG'
+  ) {
+    result = 1;
+  } else if (
+    sourceResult === 'XIU' ||
+    sourceResult === 'XỈU' ||
+    sourceResult === 'SMALL'
+  ) {
+    result = 0;
+  } else {
+    result = sum >= 11 ? 1 : 0;
+  }
 
   return {
     id: Number(id),
-    dices: dices.map(Number),
+    dices,
     sum,
     result
   };
@@ -80,7 +108,12 @@ async function syncData() {
     for (const item of list) {
       const s = normalizeSession(item);
 
-      if (!Number.isFinite(s.id) || knownIds.has(s.id)) continue;
+      if (
+        !Number.isFinite(s.id) ||
+        !Number.isFinite(s.sum) ||
+        ![0, 1].includes(s.result) ||
+        knownIds.has(s.id)
+      ) continue;
 
       history.push(s);
       knownIds.add(s.id);
@@ -101,290 +134,245 @@ async function syncData() {
   }
 }
 
-// ============ 3. FIVE DETERMINISTIC ALGORITHMS ============
+// ============ 3. STATISTICAL FUNCTIONS ============
 
-// Chuẩn hóa xác suất có làm trơn.
-function probability(tai, total, prior = 1) {
-  return (tai + prior) / (total + prior * 2);
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-// Chuẩn hóa kết quả dự đoán.
-function makePrediction(pTai, support = 0) {
-  const p = Math.max(0, Math.min(1, pTai));
+function getRate(seq) {
+  if (!seq.length) return 0.5;
+
+  const valid = seq.filter(v => v === 0 || v === 1);
+
+  if (!valid.length) return 0.5;
+
+  const tai = valid.reduce((sum, value) => sum + value, 0);
+
+  return tai / valid.length;
+}
+
+function makePrediction(pTai, strength = 0) {
+  const p = clamp(pTai, 0, 1);
 
   return {
-    pick: p >= 0.5 ? 1 : 0,
+    pick: p > 0.5 ? 1 : 0,
     pTai: p,
-    confidence: Math.max(p, 1 - p),
-    support
+    strength: clamp(strength, 0, 1)
   };
 }
 
-// --------------------------------------------------
-// 1. N-GRAM MARKOV
-// Phân tích chuỗi T/X xuất hiện trước đó.
-// --------------------------------------------------
-function algoNGram(seq) {
+// ============ 4. ALGORITHM 1: BAYESIAN BASE RATE ============
+
+function algoBayesian(seq) {
   const n = seq.length;
-  const maxOrder = Math.min(7, n - 1);
 
-  if (maxOrder < 1) return makePrediction(0.5);
+  if (n === 0) return makePrediction(0.5);
 
-  for (let order = maxOrder; order >= 1; order--) {
-    const pattern = seq.slice(n - order).join('');
+  const tai = seq.reduce((sum, value) => sum + value, 0);
 
-    let tai = 0;
-    let total = 0;
+  // Prior đối xứng, không thiên vị Tài/Xỉu.
+  const alpha = 2;
+  const beta = 2;
 
-    for (let i = 0; i + order < n; i++) {
-      const candidate = seq.slice(i, i + order).join('');
+  const pTai = (tai + alpha) / (n + alpha + beta);
 
-      if (candidate !== pattern) continue;
+  const strength = Math.abs(pTai - 0.5) * 2;
 
-      const next = seq[i + order];
-
-      if (next !== 0 && next !== 1) continue;
-
-      total++;
-
-      if (next === 1) tai++;
-    }
-
-    if (total >= 2) {
-      return makePrediction(
-        probability(tai, total),
-        total
-      );
-    }
-  }
-
-  return makePrediction(0.5);
+  return makePrediction(pTai, strength);
 }
 
-// --------------------------------------------------
-// 2. HIGHER-ORDER MARKOV
-// Kết hợp chuyển trạng thái cấp 1, 2 và 3.
-// --------------------------------------------------
-function algoHigherMarkov(seq) {
-  const n = seq.length;
-  const maxOrder = Math.min(3, n - 1);
+// ============ 5. ALGORITHM 2: MARKOV TRANSITION ============
 
-  let weightedTai = 0;
-  let totalWeight = 0;
-  let totalSupport = 0;
-
-  for (let order = 1; order <= maxOrder; order++) {
-    const pattern = seq.slice(n - order).join('');
-
-    let tai = 0;
-    let total = 0;
-
-    for (let i = 0; i + order < n; i++) {
-      const candidate = seq.slice(i, i + order).join('');
-
-      if (candidate !== pattern) continue;
-
-      const next = seq[i + order];
-
-      if (next !== 0 && next !== 1) continue;
-
-      total++;
-
-      if (next === 1) tai++;
-    }
-
-    if (total === 0) continue;
-
-    const p = probability(tai, total);
-    const weight = total / (total + 4);
-
-    weightedTai += p * weight;
-    totalWeight += weight;
-    totalSupport += total;
-  }
-
-  if (totalWeight === 0) {
-    return makePrediction(0.5);
-  }
-
-  return makePrediction(
-    weightedTai / totalWeight,
-    totalSupport
-  );
-}
-
-// --------------------------------------------------
-// 3. RUN-LENGTH ANALYSIS
-// Phân tích cầu bệt và độ dài chuỗi liên tiếp.
-// --------------------------------------------------
-function algoRunLength(seq) {
+function algoMarkov(seq) {
   const n = seq.length;
 
   if (n < 2) return makePrediction(0.5);
 
   const current = seq[n - 1];
 
-  let runLength = 1;
-
-  for (let i = n - 2; i >= 0; i--) {
-    if (seq[i] !== current) break;
-    runLength++;
-  }
+  const globalRate = getRate(seq);
 
   let tai = 0;
   let total = 0;
-  let bestDistance = Infinity;
 
-  // Duyệt những cầu đã hoàn thành trong lịch sử.
-  // Không sử dụng kết quả hiện tại làm kết quả tương lai.
-  let start = 0;
+  // Đếm xác suất kết quả tiếp theo sau trạng thái hiện tại.
+  for (let i = 1; i < n; i++) {
+    if (seq[i - 1] !== current) continue;
 
-  while (start < n - 1) {
-    let end = start;
+    total++;
 
-    while (
-      end + 1 < n &&
-      seq[end + 1] === seq[start]
-    ) {
-      end++;
-    }
-
-    // Chỉ sử dụng cầu đã có kết quả tiếp theo.
-    if (end < n - 1) {
-      const historicalRunLength = end - start + 1;
-      const distance = Math.abs(
-        historicalRunLength - runLength
-      );
-
-      if (distance <= 2) {
-        const next = seq[end + 1];
-
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          tai = 0;
-          total = 0;
-        }
-
-        if (distance === bestDistance) {
-          total++;
-
-          if (next === 1) tai++;
-        }
-      }
-    }
-
-    start = end + 1;
+    if (seq[i] === 1) tai++;
   }
 
   if (total === 0) {
-    return makePrediction(0.5);
+    return makePrediction(globalRate);
   }
 
-  return makePrediction(
-    probability(tai, total),
-    total
+  // Co xác suất về tỷ lệ tổng thể để tránh mẫu nhỏ gây lệch.
+  const priorWeight = 8;
+
+  const pTai = (
+    tai + globalRate * priorWeight
+  ) / (
+    total + priorWeight
   );
+
+  const strength = (
+    Math.abs(pTai - globalRate) * 2
+  ) * (
+    total / (total + priorWeight)
+  );
+
+  return makePrediction(pTai, strength);
 }
 
-// --------------------------------------------------
-// 4. PATTERN MATCHING
-// Phân tích cầu xen kẽ, đảo cầu và mẫu lặp.
-// --------------------------------------------------
-function algoPattern(seq) {
+// ============ 6. ALGORITHM 3: RECENT WINDOW ============
+
+function algoRecent(seq) {
   const n = seq.length;
-  const maxOrder = Math.min(8, n - 1);
 
-  let taiScore = 0;
-  let totalScore = 0;
-  let support = 0;
+  if (n < 5) return makePrediction(0.5);
 
-  for (let order = 2; order <= maxOrder; order++) {
-    const pattern = seq.slice(n - order).join('');
+  const windowSize = Math.min(30, n);
 
-    for (let i = 0; i + order < n; i++) {
-      const candidate = seq.slice(i, i + order).join('');
+  const recent = seq.slice(-windowSize);
 
-      if (candidate !== pattern) continue;
+  const globalRate = getRate(seq);
 
-      const next = seq[i + order];
+  const tai = recent.reduce((sum, value) => sum + value, 0);
 
-      if (next !== 0 && next !== 1) continue;
+  // Làm trơn dữ liệu ngắn hạn bằng tỷ lệ tổng thể.
+  const priorWeight = 10;
 
-      // Chuỗi dài hơn có trọng số cao hơn.
-      const weight = order / (order + 2);
-
-      taiScore += next * weight;
-      totalScore += weight;
-
-      support++;
-    }
-  }
-
-  if (totalScore === 0) {
-    return makePrediction(0.5);
-  }
-
-  return makePrediction(
-    probability(taiScore, totalScore, 0.5),
-    support
+  const pTai = (
+    tai + globalRate * priorWeight
+  ) / (
+    recent.length + priorWeight
   );
+
+  const strength = (
+    Math.abs(pTai - globalRate) * 2
+  ) * (
+    recent.length / (recent.length + priorWeight)
+  );
+
+  return makePrediction(pTai, strength);
 }
 
-// --------------------------------------------------
-// 5. EWMA TRANSITION ANALYSIS
-// Phân tích xu hướng gần đây bằng trọng số thời gian.
-// --------------------------------------------------
+// ============ 7. ALGORITHM 4: EWMA ============
+
 function algoEWMA(seq) {
   const n = seq.length;
 
-  if (n < 2) return makePrediction(0.5);
+  if (n < 5) return makePrediction(0.5);
 
-  const current = seq[n - 1];
-  const alpha = 0.25;
+  const globalRate = getRate(seq);
 
-  let taiWeight = 0;
-  let totalWeight = 0;
+  const alpha = 0.15;
 
-  let weight = 1;
+  let average = globalRate;
 
-  for (let i = n - 1; i >= 1; i--) {
-    if (seq[i - 1] === current) {
-      taiWeight += seq[i] * weight;
-      totalWeight += weight;
-    }
-
-    weight *= (1 - alpha);
+  for (let i = 0; i < n; i++) {
+    average =
+      alpha * seq[i] +
+      (1 - alpha) * average;
   }
 
-  if (totalWeight === 0) {
-    return makePrediction(0.5);
-  }
+  // Không để EWMA ngắn hạn lấn át tỷ lệ tổng thể.
+  const blend = 0.30;
 
-  return makePrediction(
-    probability(taiWeight, totalWeight, 0.5),
-    totalWeight
+  const pTai = (
+    globalRate * (1 - blend) +
+    average * blend
   );
+
+  const strength = Math.abs(
+    pTai - globalRate
+  ) * 2;
+
+  return makePrediction(pTai, strength);
 }
 
-// ============ 4. ENSEMBLE + WALK-FORWARD BACKTEST ============
+// ============ 8. ALGORITHM 5: MOMENTUM ============
+
+function algoMomentum(seq) {
+  const n = seq.length;
+
+  if (n < 20) return makePrediction(0.5);
+
+  const globalRate = getRate(seq);
+
+  const recentSize = Math.min(10, n);
+  const previousSize = Math.min(30, n - recentSize);
+
+  const recent = seq.slice(-recentSize);
+
+  const previous = seq.slice(
+    -(recentSize + previousSize),
+    -recentSize
+  );
+
+  if (!previous.length) {
+    return makePrediction(globalRate);
+  }
+
+  const recentRate = getRate(recent);
+  const previousRate = getRate(previous);
+
+  // Chỉ sử dụng một phần rất nhỏ chênh lệch ngắn hạn.
+  // Không giả định xu hướng sẽ tiếp tục vô hạn.
+  const adjustment = (
+    recentRate - previousRate
+  ) * 0.10;
+
+  const pTai = clamp(
+    globalRate + adjustment,
+    0.05,
+    0.95
+  );
+
+  const strength = Math.abs(
+    adjustment
+  ) * 2;
+
+  return makePrediction(pTai, strength);
+}
+
+// ============ 9. FIVE ALGORITHMS ============
 
 const ALGOS = [
-  { name: 'ngram_markov', fn: algoNGram },
-  { name: 'higher_markov', fn: algoHigherMarkov },
-  { name: 'run_length', fn: algoRunLength },
-  { name: 'pattern_matching', fn: algoPattern },
-  { name: 'ewma_transition', fn: algoEWMA }
+  { name: 'bayesian', fn: algoBayesian },
+  { name: 'markov_transition', fn: algoMarkov },
+  { name: 'recent_window', fn: algoRecent },
+  { name: 'ewma', fn: algoEWMA },
+  { name: 'momentum', fn: algoMomentum }
 ];
 
-// Trọng số thuật toán dựa trên kết quả kiểm nghiệm.
-function calculateAlgoWeight(correct, total) {
-  const accuracy = (correct + 2) / (total + 4);
+// ============ 10. ENSEMBLE ============
 
-  return 0.25 + Math.max(0, accuracy - 0.5) * 2;
-}
+function ensemblePredict(seq) {
+  if (seq.length < 10) {
+    return {
+      pick: 0,
+      confidence: 50,
+      pTai: 0.5
+    };
+  }
 
-// Tổng hợp xác suất của các thuật toán.
-function combinePredictions(predictions, weights) {
+  const predictions = ALGOS.map(algo => {
+    return algo.fn(seq);
+  });
+
+  // Trọng số giảm ảnh hưởng của các tín hiệu ngắn hạn.
+  const weights = [
+    0.30,
+    0.25,
+    0.20,
+    0.15,
+    0.10
+  ];
+
   let weightedTai = 0;
   let totalWeight = 0;
 
@@ -393,123 +381,21 @@ function combinePredictions(predictions, weights) {
     totalWeight += weights[i];
   }
 
-  if (totalWeight === 0) return 0.5;
+  let pTai = weightedTai / totalWeight;
 
-  return weightedTai / totalWeight;
-}
+  // Giới hạn độ lệch để tránh dự đoán quá tự tin.
+  pTai = clamp(pTai, 0.20, 0.80);
 
-// Thuật toán Ensemble chính.
-function ensemblePredict(seq) {
-  const n = seq.length;
+  // Nếu xác suất gần 50/50 thì xem là tín hiệu yếu.
+  const distance = Math.abs(pTai - 0.5);
 
-  if (n === 0) {
-    return {
-      pick: 0,
-      confidence: 50
-    };
-  }
-
-  // Lưu các dự đoán quá khứ theo từng thời điểm.
-  const records = [];
-
-  // Walk-forward backtesting.
-  // Mỗi lần dự đoán chỉ được sử dụng dữ liệu quá khứ.
-  for (let t = 20; t < n; t++) {
-    const training = seq.slice(0, t);
-    const actual = seq[t];
-
-    const predictions = ALGOS.map(algo => {
-      return algo.fn(training);
-    });
-
-    // Tính trọng số từ những lần dự đoán trước đó.
-    const weights = ALGOS.map((algo, index) => {
-      let correct = 0;
-      let total = 0;
-
-      for (const record of records) {
-        if (record.predictions[index].pick === record.actual) {
-          correct++;
-        }
-
-        total++;
-      }
-
-      return calculateAlgoWeight(correct, total);
-    });
-
-    const pTai = combinePredictions(
-      predictions,
-      weights
-    );
-
-    const pick = pTai >= 0.5 ? 1 : 0;
-
-    records.push({
-      actual,
-      pick,
-      predictions
-    });
-  }
-
-  // Thống kê hiệu suất từng thuật toán.
-  const algoStats = ALGOS.map((algo, index) => {
-    let correct = 0;
-    let total = 0;
-
-    for (const record of records) {
-      if (record.predictions[index].pick === record.actual) {
-        correct++;
-      }
-
-      total++;
-    }
-
-    return {
-      correct,
-      total
-    };
-  });
-
-  // Trọng số Ensemble hiện tại.
-  const weights = algoStats.map(stat => {
-    return calculateAlgoWeight(
-      stat.correct,
-      stat.total
-    );
-  });
-
-  // Phân tích chuỗi hiện tại.
-  const currentPredictions = ALGOS.map(algo => {
-    return algo.fn(seq);
-  });
-
-  const pTai = combinePredictions(
-    currentPredictions,
-    weights
+  // Điểm tin cậy thận trọng, không phải xác suất thắng.
+  const confidence = 50 + Math.min(
+    5,
+    distance * 20
   );
 
-  const pick = pTai >= 0.5 ? 1 : 0;
-
-  // Backtesting riêng cho cửa đang được dự đoán.
-  let correct = 0;
-  let total = 0;
-
-  for (const record of records) {
-    if (record.pick !== pick) continue;
-
-    total++;
-
-    if (record.actual === record.pick) {
-      correct++;
-    }
-  }
-
-  // Độ tin cậy có làm trơn Bayesian.
-  // Tránh trường hợp ít mẫu nhưng hiển thị 100%.
-  const confidence = total > 0
-    ? ((correct + 1) / (total + 2)) * 100
-    : 50;
+  const pick = pTai > 0.5 ? 1 : 0;
 
   return {
     pick,
@@ -522,34 +408,23 @@ function ensemblePredict(seq) {
       pTai * 10000
     ) / 10000,
 
-    totalBacktest: records.length,
-
-    correctBacktest: records.filter(
-      r => r.pick === r.actual
-    ).length,
-
     algorithms: ALGOS.map((algo, index) => ({
       name: algo.name,
 
-      pick: currentPredictions[index].pick,
+      pick: predictions[index].pick,
 
       probabilityTai: Math.round(
-        currentPredictions[index].pTai * 10000
+        predictions[index].pTai * 10000
       ) / 10000,
 
-      accuracy: algoStats[index].total
-        ? Math.round(
-            algoStats[index].correct /
-            algoStats[index].total * 10000
-          ) / 100
-        : 0,
-
-      samples: algoStats[index].total
+      strength: Math.round(
+        predictions[index].strength * 10000
+      ) / 10000
     }))
   };
 }
 
-// ============ 5. TIME VN ============
+// ============ 11. TIME VN ============
 
 function formatTimeVN() {
   const now = new Date(Date.now() + 7 * 3600 * 1000);
@@ -557,7 +432,7 @@ function formatTimeVN() {
   return now.toISOString().replace('Z', '+07:00');
 }
 
-// ============ 6. RESPONSE ============
+// ============ 12. RESPONSE ============
 
 function buildResponse() {
   const history = readHistory();
@@ -578,26 +453,18 @@ function buildResponse() {
 
   return {
     "id": "noname09",
-
     "phienhientai": current.id,
-
     "ketqua": current.result === 1 ? "tai" : "xiu",
-
     "xucxac": current.dices,
-
     "tong": current.sum,
-
     "dudoanphien": current.id + 1,
-
     "dudoan": ens.pick === 1 ? "tai" : "xiu",
-
     "dotincay": `${ens.confidence}%`,
-
     "uptime": formatTimeVN()
   };
 }
 
-// ============ 7. ROUTES ============
+// ============ 13. ROUTES ============
 
 app.get('/', (req, res) => res.json(buildResponse()));
 
@@ -614,7 +481,7 @@ app.get('/history', (req, res) => {
   });
 });
 
-// ============ 8. BOOT ============
+// ============ 14. BOOT ============
 
 initDataFile();
 
