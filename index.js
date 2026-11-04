@@ -15,7 +15,7 @@ const POLL_INTERVAL = 15000;
 
 function initDataFile() {
   fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-  console.log('[INIT] Đã xoá & tạo mới lichsulc79md5.json');
+  console.log('[INIT] Da reset lich su');
 }
 
 function readHistory() {
@@ -102,24 +102,26 @@ async function syncData() {
       ? raw
       : raw.data ?? raw.sessions ?? raw.list ?? [];
 
-    if (!list.length) return;
+    if (!Array.isArray(list) || !list.length) return;
 
     const history = readHistory();
     const knownIds = new Set(history.map(h => h.id));
 
     let added = 0;
 
-    for (const item of list) {
-      const s = normalizeSession(item);
+    // Sắp xếp phiên tăng dần trước khi xử lý kết quả.
+    const normalized = list
+      .map(normalizeSession)
+      .filter(s =>
+        Number.isFinite(s.id) &&
+        Number.isFinite(s.sum) &&
+        [0, 1].includes(s.result)
+      )
+      .sort((a, b) => a.id - b.id);
 
-      if (
-        !Number.isFinite(s.id) ||
-        !Number.isFinite(s.sum) ||
-        ![0, 1].includes(s.result) ||
-        knownIds.has(s.id)
-      ) continue;
+    for (const s of normalized) {
+      if (knownIds.has(s.id)) continue;
 
-      // Chỉ học khi đã có dự đoán được lưu trước đó.
       settlePrediction(s.id, s.result);
 
       history.push(s);
@@ -133,7 +135,7 @@ async function syncData() {
       writeHistory(history.slice(-500));
 
       console.log(
-        `[SYNC] +${added} phiên, tổng ${Math.min(500, history.length)}`
+        `[SYNC] +${added} phien, tong ${Math.min(500, history.length)}`
       );
     }
   } catch (err) {
@@ -146,18 +148,29 @@ async function syncData() {
 function defaultModel() {
   return {
     weights: [1, 1, 1, 1, 1],
+
     logistic: [0, 0, 0, 0, 0],
+
     pending: {},
+
     predictions: {},
+
     calibration: Array.from({ length: 10 }, () => ({
       total: 0,
       correct: 0
     })),
+
+    performance: {
+      count: 0,
+      modelLoss: 0,
+      baselineLoss: 0
+    },
+
     updates: 0
   };
 }
 
-// RESET TOÀN BỘ MÔ HÌNH MỖI LẦN KHỞI ĐỘNG
+// RESET TOAN BO MO HINH MOI LAN KHOI DONG
 function initModelFile() {
   fs.writeFileSync(
     MODEL_FILE,
@@ -165,7 +178,7 @@ function initModelFile() {
     'utf8'
   );
 
-  console.log('[INIT] Đã reset toàn bộ trọng số và dữ liệu học');
+  console.log('[INIT] Da reset toan bo trong so hoc');
 }
 
 function readModel() {
@@ -185,14 +198,24 @@ function readModel() {
       return defaultModel();
     }
 
-    // Bổ sung các trường cho model phiên bản cũ.
-    if (!model.predictions) model.predictions = {};
+    if (!model.predictions) {
+      model.predictions = {};
+    }
 
     if (
       !Array.isArray(model.calibration) ||
       model.calibration.length !== 10
     ) {
       model.calibration = defaultModel().calibration;
+    }
+
+    if (
+      !model.performance ||
+      !Number.isFinite(model.performance.count) ||
+      !Number.isFinite(model.performance.modelLoss) ||
+      !Number.isFinite(model.performance.baselineLoss)
+    ) {
+      model.performance = defaultModel().performance;
     }
 
     if (!Number.isFinite(model.updates)) {
@@ -244,11 +267,20 @@ function logLoss(probability, actual) {
   );
 }
 
+// Khong ep chon Tai hoac Xiu khi xac suat bang nhau.
 function makePrediction(pTai) {
   const p = clamp(pTai, 0.001, 0.999);
 
+  let pick = null;
+
+  if (p > 0.500001) {
+    pick = 1;
+  } else if (p < 0.499999) {
+    pick = 0;
+  }
+
   return {
-    pick: p > 0.5 ? 1 : 0,
+    pick,
     pTai: p
   };
 }
@@ -288,17 +320,18 @@ function calculateFeatures(seq) {
 
   const markovRate = transitionTotal > 0
     ? (
-        transitionTai + globalRate * 10
+        transitionTai + 0.5 * 20
       ) / (
-        transitionTotal + 10
+        transitionTotal + 20
       )
-    : globalRate;
+    : 0.5;
 
   return {
     globalRate,
     recentRate,
     ewma,
     markovRate,
+
     logistic: [
       1,
       globalRate - 0.5,
@@ -309,7 +342,7 @@ function calculateFeatures(seq) {
   };
 }
 
-// ============ 6. ALGORITHM 1: BAYESIAN ADAPTIVE ============
+// ============ 6. ALGORITHM 1: BAYESIAN ============
 
 function algoBayesian(seq, features) {
   const n = seq.length;
@@ -319,8 +352,9 @@ function algoBayesian(seq, features) {
   const tai = seq.reduce((sum, value) => sum + value, 0);
   const xiu = n - tai;
 
-  const alpha = 2;
-  const beta = 2;
+  // Prior doi xung: 20 Tai va 20 Xiu.
+  const alpha = 20;
+  const beta = 20;
 
   const pTai = (tai + alpha) /
     (tai + xiu + alpha + beta);
@@ -332,7 +366,7 @@ function algoBayesian(seq, features) {
 
 function algoMarkov(seq, features) {
   if (seq.length < 2) {
-    return makePrediction(features.globalRate);
+    return makePrediction(0.5);
   }
 
   const current = seq[seq.length - 1];
@@ -348,10 +382,11 @@ function algoMarkov(seq, features) {
     if (seq[i] === 1) tai++;
   }
 
-  const priorWeight = 12;
+  // Prior trung lap, khong lay globalRate lam huong mac dinh.
+  const priorWeight = 20;
 
   const pTai = (
-    tai + features.globalRate * priorWeight
+    tai + 0.5 * priorWeight
   ) / (
     total + priorWeight
   );
@@ -364,8 +399,8 @@ function algoMarkov(seq, features) {
 function algoRegime(seq, features) {
   const n = seq.length;
 
-  if (n < 10) {
-    return makePrediction(features.globalRate);
+  if (n < 20) {
+    return makePrediction(0.5);
   }
 
   const recentSize = Math.min(20, n);
@@ -375,21 +410,21 @@ function algoRegime(seq, features) {
   const olderStart = Math.max(0, olderEnd - 100);
   const older = seq.slice(olderStart, olderEnd);
 
+  if (!older.length) {
+    return makePrediction(0.5);
+  }
+
   const recentRate = getRate(recent);
+  const olderRate = getRate(older);
 
-  const olderRate = older.length
-    ? getRate(older)
-    : features.globalRate;
-
+  // Chi su dung do lech gan day so voi giai doan truoc.
   const difference = recentRate - olderRate;
 
   const reliability = recent.length /
-    (recent.length + 20);
-
-  const adjustment = difference * reliability * 0.5;
+    (recent.length + 30);
 
   const pTai = clamp(
-    features.globalRate + adjustment,
+    0.5 + difference * reliability * 0.5,
     0.05,
     0.95
   );
@@ -400,8 +435,8 @@ function algoRegime(seq, features) {
 // ============ 9. ALGORITHM 4: EWMA ADAPTIVE ============
 
 function algoEWMA(seq, features) {
-  if (seq.length < 3) {
-    return makePrediction(features.globalRate);
+  if (seq.length < 5) {
+    return makePrediction(0.5);
   }
 
   let average = features.globalRate;
@@ -414,9 +449,15 @@ function algoEWMA(seq, features) {
       (1 - alpha) * average;
   }
 
-  const pTai =
-    features.globalRate * 0.65 +
-    average * 0.35;
+  // Chi tinh xu huong EWMA lech khoi trung binh.
+  const reliability = seq.length /
+    (seq.length + 50);
+
+  const pTai = clamp(
+    0.5 + (average - features.globalRate) * reliability,
+    0.05,
+    0.95
+  );
 
   return makePrediction(pTai);
 }
@@ -425,7 +466,7 @@ function algoEWMA(seq, features) {
 
 function algoOnlineLogistic(seq, features, model) {
   if (seq.length < 10) {
-    return makePrediction(features.globalRate);
+    return makePrediction(0.5);
   }
 
   const coefficients = model.logistic;
@@ -478,7 +519,6 @@ function normalizeWeights(weights) {
   return safe.map(w => w * 5 / total);
 }
 
-// Chọn nhóm xác suất để hiệu chỉnh độ tin cậy.
 function getCalibrationBucket(pTai) {
   const selectedProbability = Math.max(pTai, 1 - pTai);
 
@@ -489,8 +529,8 @@ function getCalibrationBucket(pTai) {
   );
 }
 
-// Ước lượng độ chính xác từ các dự đoán đã có kết quả.
-// Prior 20 mẫu giả định ở mức 50% để tránh phóng đại khi ít dữ liệu.
+// Dung can duoi Wilson 95%.
+// Khong du du lieu thi khong tu nang do tin cay.
 function getCalibratedConfidence(pTai, model) {
   const bucket = getCalibrationBucket(pTai);
 
@@ -499,18 +539,62 @@ function getCalibratedConfidence(pTai, model) {
     correct: 0
   };
 
-  const priorTotal = 20;
-  const priorCorrect = 10;
+  const n = data.total;
+  const correct = data.correct;
 
-  const confidence = (
-    data.correct + priorCorrect
-  ) / (
-    data.total + priorTotal
+  if (n < 30) {
+    return 50;
+  }
+
+  const z = 1.96;
+  const z2 = z * z;
+
+  const observed = correct / n;
+
+  const denominator = 1 + z2 / n;
+
+  const center = observed + z2 / (2 * n);
+
+  const margin = z * Math.sqrt(
+    (
+      observed * (1 - observed) +
+      z2 / (4 * n)
+    ) / n
   );
 
+  const lowerBound = (center - margin) / denominator;
+
   return Math.round(
-    clamp(confidence * 100, 0, 100) * 100
+    clamp(lowerBound * 100, 50, 99.9) * 100
   ) / 100;
+}
+
+// Danh gia xem mo hinh co thuc su tot hon moc 50/50 hay khong.
+function getPredictionReliability(model) {
+  const performance = model.performance;
+
+  const count = performance.count || 0;
+
+  // Chua du mau thi khong cho phep mo hinh nghieng manh.
+  if (count < 30) return 0;
+
+  const modelAverage = performance.modelLoss / count;
+  const baselineAverage = performance.baselineLoss / count;
+
+  const improvement = baselineAverage - modelAverage;
+
+  // Neu mo hinh khong tot hon moc 50/50 thi trung lap.
+  if (improvement <= 0) return 0;
+
+  const evidence = clamp(improvement / 0.03, 0, 1);
+
+  const sampleReliability = count / (count + 100);
+
+  return clamp(
+    evidence * sampleReliability,
+    0,
+    1
+  );
 }
 
 function settlePrediction(sessionId, actual) {
@@ -530,6 +614,7 @@ function settlePrediction(sessionId, actual) {
     return;
   }
 
+  // Tinh Log Loss cua tung mo hinh.
   const losses = pending.probabilities.map(p => {
     return logLoss(p, actual);
   });
@@ -539,6 +624,8 @@ function settlePrediction(sessionId, actual) {
     0
   ) / losses.length;
 
+  // Mo hinh tot hon trung binh duoc tang trong so.
+  // Mo hinh kem hon bi giam trong so.
   const learningRate = 0.35;
 
   for (let i = 0; i < model.weights.length; i++) {
@@ -547,11 +634,17 @@ function settlePrediction(sessionId, actual) {
     model.weights[i] *= Math.exp(
       learningRate * improvement
     );
+
+    model.weights[i] = clamp(
+      model.weights[i],
+      0.2,
+      5
+    );
   }
 
   model.weights = normalizeWeights(model.weights);
 
-  // Cập nhật Logistic bằng gradient descent.
+  // Cap nhat Logistic bang gradient descent.
   if (
     Array.isArray(pending.features) &&
     pending.features.length === 5
@@ -581,8 +674,30 @@ function settlePrediction(sessionId, actual) {
     }
   }
 
-  // Cập nhật độ chính xác thực tế theo nhóm xác suất.
-  if (Number.isInteger(pending.calibrationBucket)) {
+  // Danh gia ensemble so voi moc du doan 50/50.
+  const ensembleProbability = clamp(
+    Number(pending.ensembleProbability ?? 0.5),
+    0.001,
+    0.999
+  );
+
+  model.performance.count++;
+
+  model.performance.modelLoss += logLoss(
+    ensembleProbability,
+    actual
+  );
+
+  model.performance.baselineLoss += logLoss(
+    0.5,
+    actual
+  );
+
+  // Hieu chinh do tin cay.
+  if (
+    Number.isInteger(pending.calibrationBucket) &&
+    (pending.pick === 0 || pending.pick === 1)
+  ) {
     const bucket = pending.calibrationBucket;
 
     if (!model.calibration[bucket]) {
@@ -592,11 +707,9 @@ function settlePrediction(sessionId, actual) {
       };
     }
 
-    const predictedPick = pending.pick;
-
     model.calibration[bucket].total++;
 
-    if (predictedPick === actual) {
+    if (pending.pick === actual) {
       model.calibration[bucket].correct++;
     }
   }
@@ -608,7 +721,7 @@ function settlePrediction(sessionId, actual) {
   writeModel(model);
 
   console.log(
-    `[LEARN] Phiên ${sessionId} | Kết quả ${actual === 1 ? 'TAI' : 'XIU'} | Updates ${model.updates}`
+    `[LEARN] Phien ${sessionId} | Ket qua ${actual === 1 ? 'TAI' : 'XIU'} | Updates ${model.updates} | Weights ${model.weights.map(x => x.toFixed(2)).join(',')}`
   );
 }
 
@@ -619,25 +732,9 @@ function getFrozenPrediction(seq, targetSessionId) {
 
   const key = String(targetSessionId);
 
-  // Nếu đã dự đoán phiên này thì trả đúng kết quả cũ.
+  // Neu da du doan phien nay thi tra lai ket qua cu.
   if (model.predictions[key]) {
     return model.predictions[key];
-  }
-
-  if (seq.length < 10) {
-    const result = {
-      pick: 0,
-      pTai: 0.5,
-      confidence: 50,
-      weights: normalizeWeights(model.weights),
-      updates: model.updates
-    };
-
-    model.predictions[key] = result;
-
-    writeModel(model);
-
-    return result;
   }
 
   const result = runAlgorithms(seq, model);
@@ -653,43 +750,54 @@ function getFrozenPrediction(seq, targetSessionId) {
     totalWeight += weights[i];
   }
 
-  const pTai = clamp(
+  // Xac suat goc cua ensemble.
+  const rawPTai = clamp(
     weightedTai / totalWeight,
     0.001,
     0.999
   );
 
-  const pick = pTai > 0.5 ? 1 : 0;
+  // Chi cho phep nghieng khi mo hinh da chung minh co loi the.
+  const reliability = getPredictionReliability(model);
 
-  // Độ tin cậy được tính từ hiệu chỉnh các dự đoán đã hoàn thành.
-  const confidence = getCalibratedConfidence(
-    pTai,
-    model
+  // Neu mo hinh chua tot hon moc 50/50 thi keo ve trung lap.
+  const pTai = clamp(
+    0.5 + (rawPTai - 0.5) * reliability,
+    0.001,
+    0.999
   );
 
+  const prediction = makePrediction(pTai);
+
+  const confidence = prediction.pick === null
+    ? 50
+    : getCalibratedConfidence(pTai, model);
+
   const frozen = {
-    pick,
+    pick: prediction.pick,
     pTai: Math.round(pTai * 10000) / 10000,
+    rawPTai: Math.round(rawPTai * 10000) / 10000,
     confidence,
+    reliability: Math.round(reliability * 10000) / 10000,
     weights: weights.map(w =>
       Math.round(w * 1000) / 1000
     ),
     updates: model.updates
   };
 
-  // Lưu dự đoán và thông tin học trước khi trả kết quả.
   model.predictions[key] = frozen;
 
+  // Luu du lieu de hoc sau khi phien co ket qua.
   model.pending[key] = {
     probabilities: predictions.map(p => p.pTai),
     features: result.features.logistic,
-    ensembleProbability: pTai,
-    pick,
+    ensembleProbability: rawPTai,
+    pick: prediction.pick,
     calibrationBucket: getCalibrationBucket(pTai),
     createdAt: Date.now()
   };
 
-  // Giới hạn số phiên lưu để file không tăng vô hạn.
+  // Gioi han so phien luu.
   const predictionKeys = Object.keys(model.predictions);
 
   if (predictionKeys.length > 100) {
@@ -732,9 +840,9 @@ function buildResponse() {
 
   if (history.length === 0) {
     return {
-      "id": "noname09",
-      "error": "Chưa có dữ liệu, chờ sync",
-      "uptime": formatTimeVN()
+      id: 'noname09',
+      error: 'Chua co du lieu, cho sync',
+      uptime: formatTimeVN()
     };
   }
 
@@ -744,22 +852,34 @@ function buildResponse() {
 
   const nextSessionId = current.id + 1;
 
-  // Luôn lấy dự đoán đã khóa cho phiên này nếu tồn tại.
   const ens = getFrozenPrediction(
     seq,
     nextSessionId
   );
 
+  let predictionText = 'can_bang';
+
+  if (ens.pick === 1) {
+    predictionText = 'tai';
+  } else if (ens.pick === 0) {
+    predictionText = 'xiu';
+  }
+
   return {
-    "id": "noname09",
-    "phienhientai": current.id,
-    "ketqua": current.result === 1 ? "tai" : "xiu",
-    "xucxac": current.dices,
-    "tong": current.sum,
-    "dudoanphien": nextSessionId,
-    "dudoan": ens.pick === 1 ? "tai" : "xiu",
-    "dotincay": `${ens.confidence}%`,
-    "uptime": formatTimeVN()
+    id: 'noname09',
+    phienhientai: current.id,
+    ketqua: current.result === 1 ? 'tai' : 'xiu',
+    xucxac: current.dices,
+    tong: current.sum,
+    dudoanphien: nextSessionId,
+    dudoan: predictionText,
+    dotincay: `${ens.confidence}%`,
+    xacsuatTai: `${(ens.pTai * 100).toFixed(2)}%`,
+    xacsuatXiu: `${((1 - ens.pTai) * 100).toFixed(2)}%`,
+    do_tin_hieu: ens.reliability,
+    trongso: ens.weights,
+    solan_hoc: ens.updates,
+    uptime: formatTimeVN()
   };
 }
 
