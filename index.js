@@ -119,7 +119,7 @@ async function syncData() {
         knownIds.has(s.id)
       ) continue;
 
-      // Chấm dự đoán đã lưu trước khi thêm kết quả mới.
+      // Chỉ học khi đã có dự đoán được lưu trước đó.
       settlePrediction(s.id, s.result);
 
       history.push(s);
@@ -148,18 +148,24 @@ function defaultModel() {
     weights: [1, 1, 1, 1, 1],
     logistic: [0, 0, 0, 0, 0],
     pending: {},
+    predictions: {},
+    calibration: Array.from({ length: 10 }, () => ({
+      total: 0,
+      correct: 0
+    })),
     updates: 0
   };
 }
 
+// RESET TOÀN BỘ MÔ HÌNH MỖI LẦN KHỞI ĐỘNG
 function initModelFile() {
-  if (!fs.existsSync(MODEL_FILE)) {
-    fs.writeFileSync(
-      MODEL_FILE,
-      JSON.stringify(defaultModel(), null, 2),
-      'utf8'
-    );
-  }
+  fs.writeFileSync(
+    MODEL_FILE,
+    JSON.stringify(defaultModel(), null, 2),
+    'utf8'
+  );
+
+  console.log('[INIT] Đã reset toàn bộ trọng số và dữ liệu học');
 }
 
 function readModel() {
@@ -177,6 +183,20 @@ function readModel() {
       typeof model.pending !== 'object'
     ) {
       return defaultModel();
+    }
+
+    // Bổ sung các trường cho model phiên bản cũ.
+    if (!model.predictions) model.predictions = {};
+
+    if (
+      !Array.isArray(model.calibration) ||
+      model.calibration.length !== 10
+    ) {
+      model.calibration = defaultModel().calibration;
+    }
+
+    if (!Number.isFinite(model.updates)) {
+      model.updates = 0;
     }
 
     return model;
@@ -244,7 +264,6 @@ function calculateFeatures(seq) {
   const recent = seq.slice(-recentSize);
   const recentRate = getRate(recent);
 
-  // EWMA
   const alpha = 0.15;
   let ewma = globalRate;
 
@@ -252,7 +271,6 @@ function calculateFeatures(seq) {
     ewma = alpha * value + (1 - alpha) * ewma;
   }
 
-  // Markov transition probability
   const current = seq[n - 1];
 
   let transitionTai = 0;
@@ -276,7 +294,6 @@ function calculateFeatures(seq) {
       )
     : globalRate;
 
-  // Các đặc trưng được chuẩn hóa quanh tỷ lệ tổng thể.
   return {
     globalRate,
     recentRate,
@@ -302,7 +319,6 @@ function algoBayesian(seq, features) {
   const tai = seq.reduce((sum, value) => sum + value, 0);
   const xiu = n - tai;
 
-  // Prior Beta đối xứng.
   const alpha = 2;
   const beta = 2;
 
@@ -332,7 +348,6 @@ function algoMarkov(seq, features) {
     if (seq[i] === 1) tai++;
   }
 
-  // Co xác suất về tỷ lệ chung để tránh mẫu nhỏ.
   const priorWeight = 12;
 
   const pTai = (
@@ -366,10 +381,8 @@ function algoRegime(seq, features) {
     ? getRate(older)
     : features.globalRate;
 
-  // Đo độ thay đổi giữa giai đoạn gần và giai đoạn trước.
   const difference = recentRate - olderRate;
 
-  // Mức thích nghi phụ thuộc lượng dữ liệu, không phụ thuộc random.
   const reliability = recent.length /
     (recent.length + 20);
 
@@ -401,7 +414,6 @@ function algoEWMA(seq, features) {
       (1 - alpha) * average;
   }
 
-  // Giới hạn ảnh hưởng ngắn hạn.
   const pTai =
     features.globalRate * 0.65 +
     average * 0.35;
@@ -424,9 +436,7 @@ function algoOnlineLogistic(seq, features, model) {
     score += coefficients[i] * features.logistic[i];
   }
 
-  const pTai = sigmoid(score);
-
-  return makePrediction(pTai);
+  return makePrediction(sigmoid(score));
 }
 
 // ============ 11. FIVE ALGORITHMS ============
@@ -465,8 +475,42 @@ function normalizeWeights(weights) {
 
   if (total <= 0) return [1, 1, 1, 1, 1];
 
-  // Tổng trọng số được chuẩn hóa bằng 5.
   return safe.map(w => w * 5 / total);
+}
+
+// Chọn nhóm xác suất để hiệu chỉnh độ tin cậy.
+function getCalibrationBucket(pTai) {
+  const selectedProbability = Math.max(pTai, 1 - pTai);
+
+  return clamp(
+    Math.floor((selectedProbability - 0.5) / 0.05),
+    0,
+    9
+  );
+}
+
+// Ước lượng độ chính xác từ các dự đoán đã có kết quả.
+// Prior 20 mẫu giả định ở mức 50% để tránh phóng đại khi ít dữ liệu.
+function getCalibratedConfidence(pTai, model) {
+  const bucket = getCalibrationBucket(pTai);
+
+  const data = model.calibration[bucket] || {
+    total: 0,
+    correct: 0
+  };
+
+  const priorTotal = 20;
+  const priorCorrect = 10;
+
+  const confidence = (
+    data.correct + priorCorrect
+  ) / (
+    data.total + priorTotal
+  );
+
+  return Math.round(
+    clamp(confidence * 100, 0, 100) * 100
+  ) / 100;
 }
 
 function settlePrediction(sessionId, actual) {
@@ -495,7 +539,6 @@ function settlePrediction(sessionId, actual) {
     0
   ) / losses.length;
 
-  // Thuật toán có Log Loss thấp hơn trung bình được tăng trọng số.
   const learningRate = 0.35;
 
   for (let i = 0; i < model.weights.length; i++) {
@@ -508,7 +551,7 @@ function settlePrediction(sessionId, actual) {
 
   model.weights = normalizeWeights(model.weights);
 
-  // Cập nhật hệ số Logistic bằng gradient descent.
+  // Cập nhật Logistic bằng gradient descent.
   if (
     Array.isArray(pending.features) &&
     pending.features.length === 5
@@ -522,7 +565,6 @@ function settlePrediction(sessionId, actual) {
     );
 
     const predicted = sigmoid(oldScore);
-
     const error = actual - predicted;
 
     const logisticRate = 0.04;
@@ -539,6 +581,26 @@ function settlePrediction(sessionId, actual) {
     }
   }
 
+  // Cập nhật độ chính xác thực tế theo nhóm xác suất.
+  if (Number.isInteger(pending.calibrationBucket)) {
+    const bucket = pending.calibrationBucket;
+
+    if (!model.calibration[bucket]) {
+      model.calibration[bucket] = {
+        total: 0,
+        correct: 0
+      };
+    }
+
+    const predictedPick = pending.pick;
+
+    model.calibration[bucket].total++;
+
+    if (predictedPick === actual) {
+      model.calibration[bucket].correct++;
+    }
+  }
+
   model.updates = (model.updates || 0) + 1;
 
   delete model.pending[key];
@@ -550,23 +612,37 @@ function settlePrediction(sessionId, actual) {
   );
 }
 
-// ============ 13. ENSEMBLE ============
+// ============ 13. FROZEN PREDICTION ============
 
-function ensemblePredict(seq, targetSessionId) {
+function getFrozenPrediction(seq, targetSessionId) {
   const model = readModel();
 
+  const key = String(targetSessionId);
+
+  // Nếu đã dự đoán phiên này thì trả đúng kết quả cũ.
+  if (model.predictions[key]) {
+    return model.predictions[key];
+  }
+
   if (seq.length < 10) {
-    return {
+    const result = {
       pick: 0,
+      pTai: 0.5,
       confidence: 50,
-      pTai: 0.5
+      weights: normalizeWeights(model.weights),
+      updates: model.updates
     };
+
+    model.predictions[key] = result;
+
+    writeModel(model);
+
+    return result;
   }
 
   const result = runAlgorithms(seq, model);
 
   const predictions = result.predictions;
-
   const weights = normalizeWeights(model.weights);
 
   let weightedTai = 0;
@@ -583,62 +659,62 @@ function ensemblePredict(seq, targetSessionId) {
     0.999
   );
 
-  // Độ tin cậy tăng rất chậm theo độ mạnh tín hiệu
-  // và số lần học thực tế.
-  const signalStrength = Math.abs(pTai - 0.5) * 2;
-
-  const learningReliability =
-    model.updates / (model.updates + 30);
-
-  const confidence = 50 +
-    signalStrength * 10 * learningReliability;
-
   const pick = pTai > 0.5 ? 1 : 0;
 
-  // Chỉ lưu dự đoán đầu tiên cho mỗi phiên mục tiêu.
-  // Không ghi đè dự đoán cũ khi API được gọi nhiều lần.
-  if (targetSessionId !== undefined) {
-    const key = String(targetSessionId);
+  // Độ tin cậy được tính từ hiệu chỉnh các dự đoán đã hoàn thành.
+  const confidence = getCalibratedConfidence(
+    pTai,
+    model
+  );
 
-    if (!model.pending[key]) {
-      model.pending[key] = {
-        probabilities: predictions.map(p => p.pTai),
-        features: result.features.logistic,
-        ensembleProbability: pTai,
-        createdAt: Date.now()
-      };
-
-      // Giới hạn số dự đoán chờ kết quả.
-      const keys = Object.keys(model.pending);
-
-      if (keys.length > 100) {
-        keys
-          .sort((a, b) => Number(a) - Number(b))
-          .slice(0, keys.length - 100)
-          .forEach(oldKey => {
-            delete model.pending[oldKey];
-          });
-      }
-
-      writeModel(model);
-    }
-  }
-
-  return {
+  const frozen = {
     pick,
-
-    confidence: Math.round(
-      clamp(confidence, 50, 60) * 100
-    ) / 100,
-
     pTai: Math.round(pTai * 10000) / 10000,
-
+    confidence,
     weights: weights.map(w =>
       Math.round(w * 1000) / 1000
     ),
-
     updates: model.updates
   };
+
+  // Lưu dự đoán và thông tin học trước khi trả kết quả.
+  model.predictions[key] = frozen;
+
+  model.pending[key] = {
+    probabilities: predictions.map(p => p.pTai),
+    features: result.features.logistic,
+    ensembleProbability: pTai,
+    pick,
+    calibrationBucket: getCalibrationBucket(pTai),
+    createdAt: Date.now()
+  };
+
+  // Giới hạn số phiên lưu để file không tăng vô hạn.
+  const predictionKeys = Object.keys(model.predictions);
+
+  if (predictionKeys.length > 100) {
+    predictionKeys
+      .sort((a, b) => Number(a) - Number(b))
+      .slice(0, predictionKeys.length - 100)
+      .forEach(oldKey => {
+        delete model.predictions[oldKey];
+      });
+  }
+
+  const pendingKeys = Object.keys(model.pending);
+
+  if (pendingKeys.length > 100) {
+    pendingKeys
+      .sort((a, b) => Number(a) - Number(b))
+      .slice(0, pendingKeys.length - 100)
+      .forEach(oldKey => {
+        delete model.pending[oldKey];
+      });
+  }
+
+  writeModel(model);
+
+  return frozen;
 }
 
 // ============ 14. TIME VN ============
@@ -668,7 +744,11 @@ function buildResponse() {
 
   const nextSessionId = current.id + 1;
 
-  const ens = ensemblePredict(seq, nextSessionId);
+  // Luôn lấy dự đoán đã khóa cho phiên này nếu tồn tại.
+  const ens = getFrozenPrediction(
+    seq,
+    nextSessionId
+  );
 
   return {
     "id": "noname09",
