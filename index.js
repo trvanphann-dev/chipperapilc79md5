@@ -7,6 +7,8 @@ const app = express();
 app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
+const MODEL_FILE = path.join(__dirname, 'model-state.json');
+
 const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
 const POLL_INTERVAL = 15000;
@@ -14,16 +16,15 @@ const MAX_HISTORY = 500;
 const PORT = process.env.PORT || 3000;
 
 // =====================================================
-// 1. DATA STORAGE
+// 1. RESET DATA KHI KHỞI ĐỘNG
 // =====================================================
 
 function initDataFile() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-    console.log('[INIT] Created history file');
-  } else {
-    console.log('[INIT] Existing history preserved');
-  }
+  fs.writeFileSync(DATA_FILE, '[]', 'utf8');
+  fs.writeFileSync(MODEL_FILE, '{}', 'utf8');
+
+  console.log('[RESET] History cleared');
+  console.log('[RESET] Model state cleared');
 }
 
 function readHistory() {
@@ -32,7 +33,7 @@ function readHistory() {
     const parsed = JSON.parse(data || '[]');
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    console.error('[READ ERROR]', err.message);
+    console.error('[READ HISTORY ERROR]', err.message);
     return [];
   }
 }
@@ -47,6 +48,49 @@ function writeHistory(arr) {
   );
 
   fs.renameSync(tempFile, DATA_FILE);
+}
+
+function defaultModelState() {
+  return {
+    weights: Array(10).fill(1),
+    pending: null,
+    lastLearnedSession: null,
+    totalLearned: 0
+  };
+}
+
+function readModelState() {
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(MODEL_FILE, 'utf8') || '{}'
+    );
+
+    const defaults = defaultModelState();
+
+    return {
+      ...defaults,
+      ...raw,
+      weights:
+        Array.isArray(raw.weights) &&
+        raw.weights.length === 10
+          ? raw.weights
+          : defaults.weights
+    };
+  } catch (err) {
+    return defaultModelState();
+  }
+}
+
+function writeModelState(state) {
+  const tempFile = MODEL_FILE + '.tmp';
+
+  fs.writeFileSync(
+    tempFile,
+    JSON.stringify(state, null, 2),
+    'utf8'
+  );
+
+  fs.renameSync(tempFile, MODEL_FILE);
 }
 
 // =====================================================
@@ -121,63 +165,6 @@ function normalizeSession(raw) {
 
 let syncInProgress = false;
 
-async function syncData() {
-  if (syncInProgress) return;
-
-  syncInProgress = true;
-
-  try {
-    const raw = await fetchSource();
-
-    const list = Array.isArray(raw)
-      ? raw
-      : raw.data ?? raw.sessions ?? raw.list ?? [];
-
-    if (!Array.isArray(list) || !list.length) {
-      return;
-    }
-
-    const history = readHistory();
-    const knownIds = new Set(history.map(h => h.id));
-
-    let added = 0;
-
-    for (const item of list) {
-      const s = normalizeSession(item);
-
-      if (
-        !Number.isFinite(s.id) ||
-        !Number.isFinite(s.sum) ||
-        ![0, 1].includes(s.result) ||
-        knownIds.has(s.id)
-      ) {
-        continue;
-      }
-
-      history.push(s);
-      knownIds.add(s.id);
-      added++;
-    }
-
-    if (added > 0) {
-      history.sort((a, b) => a.id - b.id);
-
-      const saved = history.slice(-MAX_HISTORY);
-
-      writeHistory(saved);
-
-      console.log(
-        `[SYNC] +${added} sessions | Total ${saved.length}`
-      );
-    }
-
-  } catch (err) {
-    console.error('[SYNC ERROR]', err.message);
-  } finally {
-    syncInProgress = false;
-  }
-}
-
 // =====================================================
 // 3. COMMON STATISTICS
 // =====================================================
@@ -233,7 +220,7 @@ function weightedRate(values, weights) {
 }
 
 // =====================================================
-// 4. ALGORITHM 1: BAYESIAN ADAPTIVE
+// 4. ALGORITHM 1: BAYESIAN
 // =====================================================
 
 function algoBayesian(seq) {
@@ -351,7 +338,6 @@ function algoEWMA(seq) {
   }
 
   const alpha = 0.22;
-
   let value = 0.5;
 
   for (const result of seq) {
@@ -523,14 +509,15 @@ const ALGOS = [
 ];
 
 // =====================================================
-// 15. ONLINE LEARNING CONFIGURATION
+// 15. LEARNING CONFIGURATION
 // =====================================================
 
 const LEARNING = {
   initialWeight: 1,
   minWeight: 0.15,
   maxWeight: 5,
-  learningRate: 0.12,
+  winMultiplier: 1.08,
+  lossMultiplier: 0.92,
   warmup: 12
 };
 
@@ -563,7 +550,7 @@ function combinePredictions(predictions, weights) {
   let weightTotal = 0;
 
   for (let i = 0; i < predictions.length; i++) {
-    const weight = weights[i];
+    const weight = weights[i] || 1;
 
     total += predictions[i].pTai * weight;
     weightTotal += weight;
@@ -575,76 +562,98 @@ function combinePredictions(predictions, weights) {
 }
 
 // =====================================================
-// 18. ONLINE WEIGHT LEARNING
+// 18. UPDATE WEIGHTS AFTER ACTUAL RESULT
 // =====================================================
 
-function updateWeights(predictions, actual, weights) {
+function updateWeights(predictions, actual, state) {
   for (let i = 0; i < predictions.length; i++) {
-    const error =
-      predictions[i].pTai - actual;
+    const predictedPick = predictions[i].pick;
 
-    const loss = error * error;
+    const correct = predictedPick === actual;
 
-    // Dự đoán tốt: tăng tương đối trọng số.
-    // Dự đoán kém: giảm tương đối trọng số.
-    weights[i] = clamp(
-      weights[i] * Math.exp(
-        -LEARNING.learningRate * (loss - 0.25)
-      ),
+    const multiplier = correct
+      ? LEARNING.winMultiplier
+      : LEARNING.lossMultiplier;
+
+    state.weights[i] = clamp(
+      state.weights[i] * multiplier,
       LEARNING.minWeight,
       LEARNING.maxWeight
     );
   }
+
+  state.totalLearned++;
 }
 
 // =====================================================
-// 19. MAIN PREDICTION ENGINE
+// 19. SETTLE PENDING PREDICTION
 // =====================================================
 
-function ensemblePredict(seq) {
-  const weights = ALGOS.map(
-    () => LEARNING.initialWeight
+function settlePending(history, state) {
+  if (!state.pending) return;
+
+  const pending = state.pending;
+
+  const actualSession = history.find(
+    h => String(h.id) === String(pending.targetSession)
   );
 
-  const historicalHits = [];
+  if (!actualSession) return;
 
-  const firstTrainIndex = Math.max(
-    LEARNING.warmup,
-    3
-  );
-
-  // Backtest tuần tự và cập nhật trọng số.
-  for (
-    let i = firstTrainIndex;
-    i < seq.length;
-    i++
+  if (
+    String(state.lastLearnedSession) ===
+    String(actualSession.id)
   ) {
-    const past = seq.slice(0, i);
-
-    const predictions = getAlgoPredictions(past);
-
-    const ensembleP = combinePredictions(
-      predictions,
-      weights
-    );
-
-    const actual = seq[i];
-
-    historicalHits.push(
-      (ensembleP >= 0.5 ? 1 : 0) === actual
-        ? 1
-        : 0
-    );
-
-    updateWeights(
-      predictions,
-      actual,
-      weights
-    );
+    state.pending = null;
+    writeModelState(state);
+    return;
   }
 
-  // Dự đoán phiên kế tiếp.
+  if (
+    !Array.isArray(pending.algorithmPredictions) ||
+    pending.algorithmPredictions.length !== ALGOS.length
+  ) {
+    state.pending = null;
+    writeModelState(state);
+    return;
+  }
+
+  updateWeights(
+    pending.algorithmPredictions,
+    actualSession.result,
+    state
+  );
+
+  state.lastLearnedSession = actualSession.id;
+  state.pending = null;
+
+  writeModelState(state);
+
+  console.log(
+    `[LEARN] Session ${actualSession.id} | Result ${actualSession.result === 1 ? 'TAI' : 'XIU'} | Samples ${state.totalLearned}`
+  );
+}
+
+// =====================================================
+// 20. MAIN PREDICTION ENGINE WITH SESSION LOCK
+// =====================================================
+
+function ensemblePredict(seq, currentSessionId, targetSessionId) {
+  const state = readModelState();
+
+  // Nếu phiên này đã có dự đoán thì dùng lại.
+  // Không tính lại khi tải lại API.
+  if (
+    state.pending &&
+    String(state.pending.targetSession) ===
+    String(targetSessionId)
+  ) {
+    return state.pending.response;
+  }
+
   const predictions = getAlgoPredictions(seq);
+
+  const weights = state.weights.slice();
 
   const pTai = combinePredictions(
     predictions,
@@ -653,61 +662,125 @@ function ensemblePredict(seq) {
 
   const pick = pTai >= 0.5 ? 1 : 0;
 
-  const recentHits = historicalHits.slice(-100);
-
-  const historicalAccuracy = recentHits.length
-    ? mean(recentHits)
-    : 0.5;
-
-  // Độ tin cậy thận trọng, không phải xác suất
-  // thắng đã được bảo đảm.
-  const confidence = clamp(
-    50 + Math.max(
-      0,
-      historicalAccuracy - 0.5
-    ) * 100,
-    50,
-    75
-  );
-
   const agreement = predictions.filter(
-    p => (p.pTai >= 0.5) === (pTai >= 0.5)
+    p => p.pick === pick
   ).length;
 
-  return {
+  // Độ tin cậy chỉ là chỉ số tham khảo.
+  // Không phải xác suất thắng được bảo đảm.
+  const signalStrength = Math.abs(pTai - 0.5) * 2;
+
+  const confidence = clamp(
+    50 + signalStrength * 20,
+    50,
+    70
+  );
+
+  const response = {
     pick,
-
-    confidence:
-      Math.round(confidence * 100) / 100,
-
-    pTai:
-      Math.round(pTai * 10000) / 10000,
-
+    confidence: Math.round(confidence * 100) / 100,
+    pTai: Math.round(pTai * 10000) / 10000,
     agreement: `${agreement}/${ALGOS.length}`,
-
-    historicalAccuracy:
-      Math.round(historicalAccuracy * 10000) / 100,
-
-    trainedSamples: historicalHits.length,
+    historicalAccuracy: null,
+    trainedSamples: state.totalLearned,
 
     algorithms: ALGOS.map((algo, index) => ({
       name: algo.name,
-
       pick: predictions[index].pick,
-
       probabilityTai:
-        Math.round(
-          predictions[index].pTai * 10000
-        ) / 10000,
-
+        Math.round(predictions[index].pTai * 10000) / 10000,
       weight:
         Math.round(weights[index] * 10000) / 10000
     }))
   };
+
+  // Lưu dự đoán của phiên đích.
+  state.pending = {
+    currentSession: currentSessionId,
+    targetSession: targetSessionId,
+    pick,
+    algorithmPredictions: predictions.map(p => ({
+      pick: p.pick,
+      pTai: p.pTai
+    })),
+    response
+  };
+
+  writeModelState(state);
+
+  return response;
 }
 
 // =====================================================
-// 20. VIETNAM TIME
+// 21. SYNC DATA
+// =====================================================
+
+async function syncData() {
+  if (syncInProgress) return;
+
+  syncInProgress = true;
+
+  try {
+    const raw = await fetchSource();
+
+    const list = Array.isArray(raw)
+      ? raw
+      : raw.data ?? raw.sessions ?? raw.list ?? [];
+
+    if (!Array.isArray(list) || !list.length) {
+      return;
+    }
+
+    const history = readHistory();
+
+    const knownIds = new Set(
+      history.map(h => String(h.id))
+    );
+
+    let added = 0;
+
+    for (const item of list) {
+      const s = normalizeSession(item);
+
+      if (
+        !Number.isFinite(s.id) ||
+        !Number.isFinite(s.sum) ||
+        ![0, 1].includes(s.result) ||
+        knownIds.has(String(s.id))
+      ) {
+        continue;
+      }
+
+      history.push(s);
+      knownIds.add(String(s.id));
+      added++;
+    }
+
+    if (added > 0) {
+      history.sort((a, b) => a.id - b.id);
+
+      const saved = history.slice(-MAX_HISTORY);
+
+      writeHistory(saved);
+
+      console.log(
+        `[SYNC] +${added} sessions | Total ${saved.length}`
+      );
+    }
+
+    // Kiểm tra kết quả của phiên đang chờ học.
+    const state = readModelState();
+    settlePending(history, state);
+
+  } catch (err) {
+    console.error('[SYNC ERROR]', err.message);
+  } finally {
+    syncInProgress = false;
+  }
+}
+
+// =====================================================
+// 22. VIETNAM TIME
 // =====================================================
 
 function formatTimeVN() {
@@ -722,7 +795,7 @@ function formatTimeVN() {
 }
 
 // =====================================================
-// 21. API RESPONSE
+// 23. API RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -742,7 +815,15 @@ function buildResponse() {
     h => h.result
   );
 
-  const ens = ensemblePredict(seq);
+  const targetSessionId = current.id + 1;
+
+  const ens = ensemblePredict(
+    seq,
+    current.id,
+    targetSessionId
+  );
+
+  const state = readModelState();
 
   return {
     id: 'noname09',
@@ -757,7 +838,7 @@ function buildResponse() {
 
     tong: current.sum,
 
-    dudoanphien: current.id + 1,
+    dudoanphien: targetSessionId,
 
     dudoan: ens.pick === 1
       ? 'tai'
@@ -772,21 +853,18 @@ function buildResponse() {
       `${((1 - ens.pTai) * 100).toFixed(2)}%`,
 
     dochinhxaclichsu:
-      `${ens.historicalAccuracy}%`,
+      state.totalLearned > 0
+        ? 'Đã học ' + state.totalLearned + ' phiên'
+        : 'Chưa đủ dữ liệu',
 
-    solanhoctap: ens.trainedSamples,
+    solanhoctap: state.totalLearned,
 
     dongthuan: ens.agreement,
 
     trongso: ens.algorithms.map(a => ({
       thuattoan: a.name,
-
-      du_doan: a.pick === 1
-        ? 'tai'
-        : 'xiu',
-
+      du_doan: a.pick === 1 ? 'tai' : 'xiu',
       xac_suat_tai: a.probabilityTai,
-
       trong_so: a.weight
     })),
 
@@ -795,7 +873,7 @@ function buildResponse() {
 }
 
 // =====================================================
-// 22. API ROUTES
+// 24. API ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
@@ -842,9 +920,10 @@ app.get('/history', (req, res) => {
 });
 
 // =====================================================
-// 23. BOOT SERVER
+// 25. BOOT SERVER
 // =====================================================
 
+// Xóa lịch sử và trọng số mỗi lần tiến trình khởi động.
 initDataFile();
 
 // Đồng bộ lần đầu.
@@ -871,5 +950,9 @@ app.listen(PORT, () => {
 
   console.log(
     '[BOOT] Online learning enabled'
+  );
+
+  console.log(
+    '[BOOT] History and weights reset on startup'
   );
 });
