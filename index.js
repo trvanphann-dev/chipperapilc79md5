@@ -7,24 +7,26 @@ const app = express();
 app.use(express.json());
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
-const MODEL_FILE = path.join(__dirname, 'model-state.json');
+const LEARNING_FILE = path.join(__dirname, 'learning_state.json');
 
 const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
 const POLL_INTERVAL = 15000;
 const MAX_HISTORY = 500;
+const MAX_CONTEXT = 64;
 const PORT = process.env.PORT || 3000;
 
 // =====================================================
-// 1. RESET DATA KHI KHỞI ĐỘNG
+// 1. DATA STORAGE
 // =====================================================
 
 function initDataFile() {
-  fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-  fs.writeFileSync(MODEL_FILE, '{}', 'utf8');
-
-  console.log('[RESET] History cleared');
-  console.log('[RESET] Model state cleared');
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(DATA_FILE, '[]', 'utf8');
+    console.log('[INIT] Created history file');
+  } else {
+    console.log('[INIT] Existing history preserved');
+  }
 }
 
 function readHistory() {
@@ -33,7 +35,7 @@ function readHistory() {
     const parsed = JSON.parse(data || '[]');
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    console.error('[READ HISTORY ERROR]', err.message);
+    console.error('[READ ERROR]', err.message);
     return [];
   }
 }
@@ -50,47 +52,16 @@ function writeHistory(arr) {
   fs.renameSync(tempFile, DATA_FILE);
 }
 
-function defaultModelState() {
-  return {
-    weights: Array(10).fill(1),
-    pending: null,
-    lastLearnedSession: null,
-    totalLearned: 0
-  };
-}
-
-function readModelState() {
-  try {
-    const raw = JSON.parse(
-      fs.readFileSync(MODEL_FILE, 'utf8') || '{}'
-    );
-
-    const defaults = defaultModelState();
-
-    return {
-      ...defaults,
-      ...raw,
-      weights:
-        Array.isArray(raw.weights) &&
-        raw.weights.length === 10
-          ? raw.weights
-          : defaults.weights
-    };
-  } catch (err) {
-    return defaultModelState();
-  }
-}
-
-function writeModelState(state) {
-  const tempFile = MODEL_FILE + '.tmp';
+function atomicSave(file, data) {
+  const tempFile = file + '.tmp';
 
   fs.writeFileSync(
     tempFile,
-    JSON.stringify(state, null, 2),
+    JSON.stringify(data, null, 2),
     'utf8'
   );
 
-  fs.renameSync(tempFile, MODEL_FILE);
+  fs.renameSync(tempFile, file);
 }
 
 // =====================================================
@@ -163,33 +134,133 @@ function normalizeSession(raw) {
   };
 }
 
-let syncInProgress = false;
+// =====================================================
+// 3. LEARNING CONFIGURATION
+// =====================================================
+
+const LEARNING = {
+  initialWeight: 1,
+  minWeight: 0.1,
+  maxWeight: 10,
+
+  metaLearningRate: 0.08,
+  logisticLearningRate: 0.035,
+  neuralLearningRate: 0.025,
+
+  ewmaAlpha: 0.15,
+  monteCarloSamples: 256
+};
+
+const ALGO_NAMES = [
+  'bayesian_online',
+  'monte_carlo',
+  'online_logistic',
+  'adaptive_neural_network',
+  'ewma_online'
+];
 
 // =====================================================
-// 3. COMMON STATISTICS
+// 4. INITIAL LEARNING STATE
+// =====================================================
+
+function createLearningState() {
+  return {
+    initialized: false,
+    lastProcessedId: null,
+
+    version: 1,
+
+    // Bayesian model
+    bayesian: {
+      alpha: 2,
+      beta: 2
+    },
+
+    // Online logistic model
+    logistic: {
+      weights: [0, 0, 0, 0]
+    },
+
+    // Adaptive neural network
+    neural: {
+      inputSize: 4,
+
+      hidden: [
+        [0.12, -0.08, 0.05, 0.10],
+        [-0.06, 0.11, 0.08, -0.04],
+        [0.09, 0.04, -0.12, 0.07],
+        [-0.10, 0.06, 0.03, 0.12]
+      ],
+
+      output: [0.1, -0.1, 0.08, 0.05],
+      bias: 0
+    },
+
+    // EWMA
+    ewma: {
+      value: 0.5
+    },
+
+    // Ensemble meta-learning
+    metaWeights: [
+      1, 1, 1, 1, 1
+    ],
+
+    // Compact context from NEW observations only
+    recent: [],
+
+    stats: {
+      total: 0,
+      hits: 0,
+      lastAccuracy: 0
+    }
+  };
+}
+
+function loadLearningState() {
+  try {
+    if (!fs.existsSync(LEARNING_FILE)) {
+      return createLearningState();
+    }
+
+    const parsed = JSON.parse(
+      fs.readFileSync(LEARNING_FILE, 'utf8')
+    );
+
+    if (
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.metaWeights) ||
+      !Array.isArray(parsed.recent)
+    ) {
+      console.error('[LEARNING] Invalid state, initializing');
+      return createLearningState();
+    }
+
+    return parsed;
+
+  } catch (err) {
+    console.error('[LEARNING LOAD]', err.message);
+    return createLearningState();
+  }
+}
+
+function saveLearningState() {
+  atomicSave(LEARNING_FILE, learningState);
+}
+
+let learningState = null;
+
+// =====================================================
+// 5. COMMON FUNCTIONS
 // =====================================================
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function mean(seq, fallback = 0.5) {
-  if (!seq.length) return fallback;
-
-  return seq.reduce(
-    (sum, value) => sum + value,
-    0
-  ) / seq.length;
-}
-
-function smoothedRate(seq, alpha = 2, beta = 2) {
-  const tai = seq.reduce(
-    (sum, value) => sum + value,
-    0
-  );
-
-  return (tai + alpha) /
-    (seq.length + alpha + beta);
+function sigmoid(x) {
+  x = clamp(x, -30, 30);
+  return 1 / (1 + Math.exp(-x));
 }
 
 function makePrediction(pTai) {
@@ -205,330 +276,275 @@ function makePrediction(pTai) {
   };
 }
 
-function weightedRate(values, weights) {
-  let total = 0;
-  let totalWeight = 0;
+// =====================================================
+// 6. FEATURE ENGINEERING
+// =====================================================
 
-  for (let i = 0; i < values.length; i++) {
-    total += values[i] * weights[i];
-    totalWeight += weights[i];
-  }
+function getFeatures(state) {
+  const recent = state.recent;
 
-  return totalWeight
-    ? total / totalWeight
+  const last = recent.length
+    ? recent[recent.length - 1]
     : 0.5;
-}
 
-// =====================================================
-// 4. ALGORITHM 1: BAYESIAN
-// =====================================================
+  let streak = 0;
 
-function algoBayesian(seq) {
-  return makePrediction(
-    smoothedRate(seq, 2, 2)
-  );
-}
+  if (recent.length) {
+    const current = recent[recent.length - 1];
 
-// =====================================================
-// 5. ALGORITHM 2: MARKOV CHAIN
-// =====================================================
-
-function algoMarkov(seq) {
-  if (seq.length < 2) {
-    return makePrediction(0.5);
-  }
-
-  const current = seq[seq.length - 1];
-  const next = [];
-
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i - 1] === current) {
-      next.push(seq[i]);
+    for (let i = recent.length - 1; i >= 0; i--) {
+      if (recent[i] !== current) break;
+      streak++;
     }
+
+    streak *= current === 1 ? 1 : -1;
   }
 
+  return [
+    1,
+    last * 2 - 1,
+    (state.ewma.value - 0.5) * 2,
+    clamp(streak / 10, -1, 1)
+  ];
+}
+
+// =====================================================
+// 7. ALGORITHM 1: BAYESIAN ONLINE
+// =====================================================
+
+function algoBayesian(state) {
+  const a = state.bayesian.alpha;
+  const b = state.bayesian.beta;
+
   return makePrediction(
-    smoothedRate(next, 2, 2)
+    a / (a + b)
   );
 }
 
 // =====================================================
-// 6. ALGORITHM 3: HIGHER ORDER MARKOV
+// 8. ALGORITHM 2: MONTE CARLO
 // =====================================================
 
-function algoHigherMarkov(seq) {
-  if (seq.length < 3) {
-    return makePrediction(0.5);
+function randomGamma(shape) {
+  if (shape < 1) {
+    return randomGamma(shape + 1) *
+      Math.pow(Math.random(), 1 / shape);
   }
 
-  const a = seq[seq.length - 2];
-  const b = seq[seq.length - 1];
+  const d = shape - 1 / 3;
+  const c = 1 / Math.sqrt(9 * d);
 
-  const next = [];
+  while (true) {
+    let x, v;
 
-  for (let i = 2; i < seq.length; i++) {
+    do {
+      const u1 = Math.random();
+      const u2 = Math.random();
+
+      x = Math.sqrt(-2 * Math.log(u1)) *
+        Math.cos(2 * Math.PI * u2);
+
+      v = 1 + c * x;
+
+    } while (v <= 0);
+
+    v = v * v * v;
+
+    const u = Math.random();
+
     if (
-      seq[i - 2] === a &&
-      seq[i - 1] === b
+      u < 1 - 0.0331 * x * x * x * x ||
+      Math.log(u) <
+      0.5 * x * x + d * (1 - v + Math.log(v))
     ) {
-      next.push(seq[i]);
+      return d * v;
     }
   }
+}
+
+function algoMonteCarlo(state) {
+  const a = state.bayesian.alpha;
+  const b = state.bayesian.beta;
+
+  let total = 0;
+
+  for (
+    let i = 0;
+    i < LEARNING.monteCarloSamples;
+    i++
+  ) {
+    const x = randomGamma(a);
+    const y = randomGamma(b);
+
+    total += x / (x + y);
+  }
 
   return makePrediction(
-    smoothedRate(next, 2, 2)
+    total / LEARNING.monteCarloSamples
   );
 }
 
 // =====================================================
-// 7. ALGORITHM 4: RUN LENGTH
+// 9. ALGORITHM 3: ONLINE LOGISTIC LEARNING
 // =====================================================
 
-function algoRunLength(seq) {
-  if (seq.length < 3) {
-    return makePrediction(0.5);
+function algoLogistic(state) {
+  const features = getFeatures(state);
+  const weights = state.logistic.weights;
+
+  let z = 0;
+
+  for (let i = 0; i < features.length; i++) {
+    z += features[i] * weights[i];
   }
 
-  const current = seq[seq.length - 1];
+  return makePrediction(sigmoid(z));
+}
 
-  let run = 1;
+function updateLogistic(state, actual, features) {
+  const weights = state.logistic.weights;
 
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] !== current) break;
-    run++;
+  let z = 0;
+
+  for (let i = 0; i < features.length; i++) {
+    z += features[i] * weights[i];
   }
 
-  const continuations = [];
+  const prediction = sigmoid(z);
+  const error = actual - prediction;
 
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i - 1] !== current) continue;
+  for (let i = 0; i < weights.length; i++) {
+    weights[i] +=
+      LEARNING.logisticLearningRate *
+      error *
+      features[i];
+  }
+}
 
-    let priorRun = 1;
+// =====================================================
+// 10. ALGORITHM 4: ADAPTIVE NEURAL NETWORK
+// =====================================================
 
-    for (let j = i - 2; j >= 0; j--) {
-      if (seq[j] !== current) break;
-      priorRun++;
+function algoNeural(state) {
+  const features = getFeatures(state);
+  const neural = state.neural;
+
+  const hiddenValues = neural.hidden.map(row => {
+    let sum = 0;
+
+    for (let i = 0; i < features.length; i++) {
+      sum += row[i] * features[i];
     }
 
-    if (priorRun === run) {
-      continuations.push(
-        seq[i] === current ? 1 : 0
-      );
+    return Math.tanh(sum);
+  });
+
+  let output = neural.bias;
+
+  for (let i = 0; i < hiddenValues.length; i++) {
+    output +=
+      hiddenValues[i] * neural.output[i];
+  }
+
+  return makePrediction(sigmoid(output));
+}
+
+function updateNeural(state, actual, features) {
+  const neural = state.neural;
+
+  const hiddenValues = [];
+  const hiddenDerivatives = [];
+
+  for (const row of neural.hidden) {
+    let sum = 0;
+
+    for (let i = 0; i < features.length; i++) {
+      sum += row[i] * features[i];
     }
+
+    const h = Math.tanh(sum);
+
+    hiddenValues.push(h);
+    hiddenDerivatives.push(1 - h * h);
   }
 
-  const pSame = smoothedRate(
-    continuations,
-    2,
-    2
-  );
+  let output = neural.bias;
 
-  return makePrediction(
-    current === 1 ? pSame : 1 - pSame
-  );
-}
-
-// =====================================================
-// 8. ALGORITHM 5: EWMA
-// =====================================================
-
-function algoEWMA(seq) {
-  if (!seq.length) {
-    return makePrediction(0.5);
+  for (let i = 0; i < hiddenValues.length; i++) {
+    output +=
+      hiddenValues[i] * neural.output[i];
   }
 
-  const alpha = 0.22;
-  let value = 0.5;
+  const prediction = sigmoid(output);
+  const error = actual - prediction;
 
-  for (const result of seq) {
-    value =
-      alpha * result +
-      (1 - alpha) * value;
+  const oldOutput = [...neural.output];
+
+  // Update output layer
+  for (let i = 0; i < neural.output.length; i++) {
+    neural.output[i] +=
+      LEARNING.neuralLearningRate *
+      error *
+      hiddenValues[i];
   }
 
-  return makePrediction(value);
-}
+  neural.bias +=
+    LEARNING.neuralLearningRate * error;
 
-// =====================================================
-// 9. ALGORITHM 6: MOMENTUM
-// =====================================================
+  // Update hidden layer
+  for (let h = 0; h < neural.hidden.length; h++) {
+    const hiddenError =
+      error *
+      oldOutput[h] *
+      hiddenDerivatives[h];
 
-function algoMomentum(seq) {
-  const recent = seq.slice(-30);
-
-  if (recent.length < 3) {
-    return makePrediction(0.5);
-  }
-
-  const weights = recent.map(
-    (_, i) => i + 1
-  );
-
-  return makePrediction(
-    weightedRate(recent, weights)
-  );
-}
-
-// =====================================================
-// 10. ALGORITHM 7: FREQUENCY WINDOW
-// =====================================================
-
-function algoFrequencyWindow(seq) {
-  if (!seq.length) {
-    return makePrediction(0.5);
-  }
-
-  const p7 = smoothedRate(seq.slice(-7));
-  const p20 = smoothedRate(seq.slice(-20));
-  const p50 = smoothedRate(seq.slice(-50));
-
-  return makePrediction(
-    p7 * 0.5 +
-    p20 * 0.3 +
-    p50 * 0.2
-  );
-}
-
-// =====================================================
-// 11. ALGORITHM 8: TRANSITION PATTERN
-// =====================================================
-
-function algoTransitionPattern(seq) {
-  if (seq.length < 4) {
-    return makePrediction(0.5);
-  }
-
-  const pattern = seq.slice(-3).join('');
-  const matches = [];
-
-  for (let i = 3; i < seq.length; i++) {
-    if (
-      seq.slice(i - 3, i).join('') === pattern
+    for (
+      let i = 0;
+      i < features.length;
+      i++
     ) {
-      matches.push(seq[i]);
+      neural.hidden[h][i] +=
+        LEARNING.neuralLearningRate *
+        hiddenError *
+        features[i];
     }
   }
-
-  return makePrediction(
-    smoothedRate(matches, 2, 2)
-  );
 }
 
 // =====================================================
-// 12. ALGORITHM 9: STREAK HAZARD
+// 11. ALGORITHM 5: EWMA ONLINE
 // =====================================================
 
-function algoStreakHazard(seq) {
-  if (seq.length < 3) {
-    return makePrediction(0.5);
-  }
-
-  const current = seq[seq.length - 1];
-
-  let run = 1;
-
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] !== current) break;
-    run++;
-  }
-
-  let switches = 0;
-  let observations = 0;
-
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i - 1] !== current) continue;
-
-    let length = 1;
-
-    for (let j = i - 2; j >= 0; j--) {
-      if (seq[j] !== current) break;
-      length++;
-    }
-
-    if (length === run) {
-      observations++;
-
-      if (seq[i] !== current) {
-        switches++;
-      }
-    }
-  }
-
-  const pSwitch =
-    (switches + 1) / (observations + 2);
-
-  const pSame = 1 - pSwitch;
-
+function algoEWMA(state) {
   return makePrediction(
-    current === 1 ? pSame : 1 - pSame
+    state.ewma.value
   );
 }
 
-// =====================================================
-// 13. ALGORITHM 10: PATTERN SIMILARITY
-// =====================================================
+function updateEWMA(state, actual) {
+  const alpha = LEARNING.ewmaAlpha;
 
-function algoPatternSimilarity(seq) {
-  const size = 4;
-
-  if (seq.length <= size) {
-    return makePrediction(0.5);
-  }
-
-  const pattern = seq.slice(-size).join('');
-  const matches = [];
-
-  for (let i = size; i < seq.length; i++) {
-    if (
-      seq.slice(i - size, i).join('') === pattern
-    ) {
-      matches.push(seq[i]);
-    }
-  }
-
-  return makePrediction(
-    smoothedRate(matches, 2, 2)
-  );
+  state.ewma.value =
+    alpha * actual +
+    (1 - alpha) * state.ewma.value;
 }
 
 // =====================================================
-// 14. REGISTER ALGORITHMS
+// 12. REGISTER FIVE ALGORITHMS
 // =====================================================
 
 const ALGOS = [
-  { name: 'bayesian_adaptive', fn: algoBayesian },
-  { name: 'markov_order_1', fn: algoMarkov },
-  { name: 'higher_order_markov', fn: algoHigherMarkov },
-  { name: 'run_length', fn: algoRunLength },
-  { name: 'ewma', fn: algoEWMA },
-  { name: 'momentum', fn: algoMomentum },
-  { name: 'frequency_window', fn: algoFrequencyWindow },
-  { name: 'transition_pattern', fn: algoTransitionPattern },
-  { name: 'streak_hazard', fn: algoStreakHazard },
-  { name: 'pattern_similarity', fn: algoPatternSimilarity }
+  { name: ALGO_NAMES[0], fn: algoBayesian },
+  { name: ALGO_NAMES[1], fn: algoMonteCarlo },
+  { name: ALGO_NAMES[2], fn: algoLogistic },
+  { name: ALGO_NAMES[3], fn: algoNeural },
+  { name: ALGO_NAMES[4], fn: algoEWMA }
 ];
 
-// =====================================================
-// 15. LEARNING CONFIGURATION
-// =====================================================
-
-const LEARNING = {
-  initialWeight: 1,
-  minWeight: 0.15,
-  maxWeight: 5,
-  winMultiplier: 1.08,
-  lossMultiplier: 0.92,
-  warmup: 12
-};
-
-// =====================================================
-// 16. RUN ALL ALGORITHMS
-// =====================================================
-
-function getAlgoPredictions(seq) {
+function getAlgoPredictions(state) {
   return ALGOS.map(algo => {
     try {
-      return algo.fn(seq);
+      return algo.fn(state);
     } catch (err) {
       console.error(
         '[ALGO ERROR]',
@@ -542,7 +558,7 @@ function getAlgoPredictions(seq) {
 }
 
 // =====================================================
-// 17. WEIGHTED ENSEMBLE
+// 13. ENSEMBLE META-LEARNING
 // =====================================================
 
 function combinePredictions(predictions, weights) {
@@ -550,7 +566,7 @@ function combinePredictions(predictions, weights) {
   let weightTotal = 0;
 
   for (let i = 0; i < predictions.length; i++) {
-    const weight = weights[i] || 1;
+    const weight = weights[i];
 
     total += predictions[i].pTai * weight;
     weightTotal += weight;
@@ -561,159 +577,192 @@ function combinePredictions(predictions, weights) {
     : 0.5;
 }
 
-// =====================================================
-// 18. UPDATE WEIGHTS AFTER ACTUAL RESULT
-// =====================================================
+function updateMetaWeights(predictions, actual, state) {
+  const weights = state.metaWeights;
 
-function updateWeights(predictions, actual, state) {
   for (let i = 0; i < predictions.length; i++) {
-    const predictedPick = predictions[i].pick;
+    const error =
+      predictions[i].pTai - actual;
 
-    const correct = predictedPick === actual;
+    const loss = error * error;
 
-    const multiplier = correct
-      ? LEARNING.winMultiplier
-      : LEARNING.lossMultiplier;
-
-    state.weights[i] = clamp(
-      state.weights[i] * multiplier,
+    weights[i] = clamp(
+      weights[i] * Math.exp(
+        -LEARNING.metaLearningRate * loss
+      ),
       LEARNING.minWeight,
       LEARNING.maxWeight
     );
   }
-
-  state.totalLearned++;
 }
 
 // =====================================================
-// 19. SETTLE PENDING PREDICTION
+// 14. ONLINE LEARNING ENGINE
 // =====================================================
 
-function settlePending(history, state) {
-  if (!state.pending) return;
+// This function processes each NEW result exactly once.
+// It never reads or loops through old history.
 
-  const pending = state.pending;
+function learnFromNewResult(actual) {
+  const state = learningState;
 
-  const actualSession = history.find(
-    h => String(h.id) === String(pending.targetSession)
+  const features = getFeatures(state);
+
+  // Prediction made BEFORE observing actual result.
+  const predictions = getAlgoPredictions(state);
+
+  const ensembleP = combinePredictions(
+    predictions,
+    state.metaWeights
   );
 
-  if (!actualSession) return;
+  const predicted = ensembleP >= 0.5 ? 1 : 0;
 
-  if (
-    String(state.lastLearnedSession) ===
-    String(actualSession.id)
-  ) {
-    state.pending = null;
-    writeModelState(state);
-    return;
+  // Online performance tracking.
+  state.stats.total++;
+
+  if (predicted === actual) {
+    state.stats.hits++;
   }
 
-  if (
-    !Array.isArray(pending.algorithmPredictions) ||
-    pending.algorithmPredictions.length !== ALGOS.length
-  ) {
-    state.pending = null;
-    writeModelState(state);
-    return;
-  }
+  state.stats.lastAccuracy =
+    state.stats.total
+      ? state.stats.hits / state.stats.total
+      : 0;
 
-  updateWeights(
-    pending.algorithmPredictions,
-    actualSession.result,
+  // Update ensemble weights.
+  updateMetaWeights(
+    predictions,
+    actual,
     state
   );
 
-  state.lastLearnedSession = actualSession.id;
-  state.pending = null;
+  // Update Bayesian posterior.
+  if (actual === 1) {
+    state.bayesian.alpha++;
+  } else {
+    state.bayesian.beta++;
+  }
 
-  writeModelState(state);
+  // Update logistic model.
+  updateLogistic(
+    state,
+    actual,
+    features
+  );
+
+  // Update neural network.
+  updateNeural(
+    state,
+    actual,
+    features
+  );
+
+  // Update EWMA.
+  updateEWMA(
+    state,
+    actual
+  );
+
+  // Store compact online context.
+  state.recent.push(actual);
+
+  if (state.recent.length > MAX_CONTEXT) {
+    state.recent.shift();
+  }
 
   console.log(
-    `[LEARN] Session ${actualSession.id} | Result ${actualSession.result === 1 ? 'TAI' : 'XIU'} | Samples ${state.totalLearned}`
+    `[LEARNING] Actual=${actual} | ` +
+    `Prediction=${predicted} | ` +
+    `Accuracy=${(state.stats.lastAccuracy * 100).toFixed(2)}%`
   );
 }
 
 // =====================================================
-// 20. MAIN PREDICTION ENGINE WITH SESSION LOCK
+// 15. MAIN PREDICTION ENGINE
 // =====================================================
 
-function ensemblePredict(seq, currentSessionId, targetSessionId) {
-  const state = readModelState();
+function ensemblePredict() {
+  const state = learningState || createLearningState();
 
-  // Nếu phiên này đã có dự đoán thì dùng lại.
-  // Không tính lại khi tải lại API.
-  if (
-    state.pending &&
-    String(state.pending.targetSession) ===
-    String(targetSessionId)
-  ) {
-    return state.pending.response;
-  }
-
-  const predictions = getAlgoPredictions(seq);
-
-  const weights = state.weights.slice();
+  const predictions = getAlgoPredictions(state);
 
   const pTai = combinePredictions(
     predictions,
-    weights
+    state.metaWeights
   );
 
   const pick = pTai >= 0.5 ? 1 : 0;
 
   const agreement = predictions.filter(
-    p => p.pick === pick
+    p => (p.pTai >= 0.5) === (pTai >= 0.5)
   ).length;
 
-  // Độ tin cậy chỉ là chỉ số tham khảo.
-  // Không phải xác suất thắng được bảo đảm.
-  const signalStrength = Math.abs(pTai - 0.5) * 2;
+  const accuracy = state.stats.lastAccuracy;
 
+  // Conservative display metric.
+  // This is not a guaranteed win probability.
   const confidence = clamp(
-    50 + signalStrength * 20,
+    50 + Math.max(0, accuracy - 0.5) * 50,
     50,
-    70
+    75
   );
 
-  const response = {
+  return {
     pick,
-    confidence: Math.round(confidence * 100) / 100,
-    pTai: Math.round(pTai * 10000) / 10000,
-    agreement: `${agreement}/${ALGOS.length}`,
-    historicalAccuracy: null,
-    trainedSamples: state.totalLearned,
+
+    confidence:
+      Math.round(confidence * 100) / 100,
+
+    pTai:
+      Math.round(pTai * 10000) / 10000,
+
+    agreement:
+      `${agreement}/${ALGOS.length}`,
+
+    historicalAccuracy:
+      Math.round(accuracy * 10000) / 100,
+
+    trainedSamples: state.stats.total,
 
     algorithms: ALGOS.map((algo, index) => ({
       name: algo.name,
+
       pick: predictions[index].pick,
+
       probabilityTai:
-        Math.round(predictions[index].pTai * 10000) / 10000,
+        Math.round(
+          predictions[index].pTai * 10000
+        ) / 10000,
+
       weight:
-        Math.round(weights[index] * 10000) / 10000
+        Math.round(
+          state.metaWeights[index] * 10000
+        ) / 10000
     }))
   };
-
-  // Lưu dự đoán của phiên đích.
-  state.pending = {
-    currentSession: currentSessionId,
-    targetSession: targetSessionId,
-    pick,
-    algorithmPredictions: predictions.map(p => ({
-      pick: p.pick,
-      pTai: p.pTai
-    })),
-    response
-  };
-
-  writeModelState(state);
-
-  return response;
 }
 
 // =====================================================
-// 21. SYNC DATA
+// 16. VIETNAM TIME
 // =====================================================
+
+function formatTimeVN() {
+  const now = new Date(
+    Date.now() + 7 * 3600 * 1000
+  );
+
+  return now.toISOString().replace(
+    'Z',
+    '+07:00'
+  );
+}
+
+// =====================================================
+// 17. SOURCE DATA SYNC + ONLINE LEARNING
+// =====================================================
+
+let syncInProgress = false;
 
 async function syncData() {
   if (syncInProgress) return;
@@ -734,10 +783,10 @@ async function syncData() {
     const history = readHistory();
 
     const knownIds = new Set(
-      history.map(h => String(h.id))
+      history.map(h => h.id)
     );
 
-    let added = 0;
+    const newSessions = [];
 
     for (const item of list) {
       const s = normalizeSession(item);
@@ -746,17 +795,18 @@ async function syncData() {
         !Number.isFinite(s.id) ||
         !Number.isFinite(s.sum) ||
         ![0, 1].includes(s.result) ||
-        knownIds.has(String(s.id))
+        knownIds.has(s.id)
       ) {
         continue;
       }
 
       history.push(s);
-      knownIds.add(String(s.id));
-      added++;
+      knownIds.add(s.id);
+
+      newSessions.push(s);
     }
 
-    if (added > 0) {
+    if (newSessions.length > 0) {
       history.sort((a, b) => a.id - b.id);
 
       const saved = history.slice(-MAX_HISTORY);
@@ -764,13 +814,54 @@ async function syncData() {
       writeHistory(saved);
 
       console.log(
-        `[SYNC] +${added} sessions | Total ${saved.length}`
+        `[SYNC] +${newSessions.length} sessions | Total ${saved.length}`
       );
     }
 
-    // Kiểm tra kết quả của phiên đang chờ học.
-    const state = readModelState();
-    settlePending(history, state);
+    // First startup:
+    // Establish a baseline without training from old history.
+    if (!learningState.initialized) {
+      const latest = history.length
+        ? Math.max(...history.map(h => h.id))
+        : null;
+
+      learningState.initialized = true;
+      learningState.lastProcessedId = latest;
+
+      saveLearningState();
+
+      console.log(
+        '[LEARNING] Fresh online learning initialized'
+      );
+
+      console.log(
+        '[LEARNING] Existing history was NOT used for training'
+      );
+
+      return;
+    }
+
+    // Process only newly received sessions.
+    const pending = newSessions
+      .filter(s =>
+        learningState.lastProcessedId === null ||
+        s.id > learningState.lastProcessedId
+      )
+      .sort((a, b) => a.id - b.id);
+
+    for (const session of pending) {
+      learnFromNewResult(session.result);
+
+      learningState.lastProcessedId = session.id;
+    }
+
+    if (pending.length > 0) {
+      saveLearningState();
+
+      console.log(
+        `[LEARNING] Processed ${pending.length} new results`
+      );
+    }
 
   } catch (err) {
     console.error('[SYNC ERROR]', err.message);
@@ -780,22 +871,7 @@ async function syncData() {
 }
 
 // =====================================================
-// 22. VIETNAM TIME
-// =====================================================
-
-function formatTimeVN() {
-  const now = new Date(
-    Date.now() + 7 * 3600 * 1000
-  );
-
-  return now.toISOString().replace(
-    'Z',
-    '+07:00'
-  );
-}
-
-// =====================================================
-// 23. API RESPONSE
+// 18. API RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -811,19 +887,9 @@ function buildResponse() {
 
   const current = history[history.length - 1];
 
-  const seq = history.map(
-    h => h.result
-  );
-
-  const targetSessionId = current.id + 1;
-
-  const ens = ensemblePredict(
-    seq,
-    current.id,
-    targetSessionId
-  );
-
-  const state = readModelState();
+  // Prediction uses persistent online state.
+  // No historical backtesting.
+  const ens = ensemblePredict();
 
   return {
     id: 'noname09',
@@ -838,7 +904,7 @@ function buildResponse() {
 
     tong: current.sum,
 
-    dudoanphien: targetSessionId,
+    dudoanphien: current.id + 1,
 
     dudoan: ens.pick === 1
       ? 'tai'
@@ -853,19 +919,26 @@ function buildResponse() {
       `${((1 - ens.pTai) * 100).toFixed(2)}%`,
 
     dochinhxaclichsu:
-      state.totalLearned > 0
-        ? 'Đã học ' + state.totalLearned + ' phiên'
-        : 'Chưa đủ dữ liệu',
+      `${ens.historicalAccuracy}%`,
 
-    solanhoctap: state.totalLearned,
+    solanhoctap:
+      ens.trainedSamples,
 
-    dongthuan: ens.agreement,
+    dongthuan:
+      ens.agreement,
 
     trongso: ens.algorithms.map(a => ({
       thuattoan: a.name,
-      du_doan: a.pick === 1 ? 'tai' : 'xiu',
-      xac_suat_tai: a.probabilityTai,
-      trong_so: a.weight
+
+      du_doan: a.pick === 1
+        ? 'tai'
+        : 'xiu',
+
+      xac_suat_tai:
+        a.probabilityTai,
+
+      trong_so:
+        a.weight
     })),
 
     uptime: formatTimeVN()
@@ -873,7 +946,7 @@ function buildResponse() {
 }
 
 // =====================================================
-// 24. API ROUTES
+// 19. API ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
@@ -920,16 +993,17 @@ app.get('/history', (req, res) => {
 });
 
 // =====================================================
-// 25. BOOT SERVER
+// 20. BOOT SERVER
 // =====================================================
 
-// Xóa lịch sử và trọng số mỗi lần tiến trình khởi động.
 initDataFile();
 
-// Đồng bộ lần đầu.
+learningState = loadLearningState();
+
+// Initial synchronization.
 syncData();
 
-// Đồng bộ định kỳ.
+// Periodic synchronization.
 const syncTimer = setInterval(
   syncData,
   POLL_INTERVAL
@@ -949,10 +1023,10 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    '[BOOT] Online learning enabled'
+    '[BOOT] Persistent online learning enabled'
   );
 
   console.log(
-    '[BOOT] History and weights reset on startup'
+    `[BOOT] Learning state: ${LEARNING_FILE}`
   );
 });
