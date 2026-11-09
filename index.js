@@ -1,4 +1,6 @@
 
+'use strict';
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -6,8 +8,13 @@ const path = require('path');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// =====================================================
+// 1. CONFIGURATION
+// =====================================================
+
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
 const LEARNING_FILE = path.join(__dirname, 'learning_state.json');
+const DEPLOY_MARKER = path.join(__dirname, 'deploy_marker.json');
 
 const SOURCE_API =
   'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
@@ -15,31 +22,153 @@ const SOURCE_API =
 const POLL_INTERVAL = 15000;
 const MAX_HISTORY = 500;
 const MAX_CONTEXT = 64;
-const MAX_PROCESSED_IDS = 2000;
+const MAX_PROCESSED_IDS = 3000;
+
 const PORT = process.env.PORT || 3000;
 
+// Render cung cấp RENDER_GIT_COMMIT.
+// Local có thể tự đặt DEPLOY_ID.
+const DEPLOY_ID =
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.DEPLOY_ID ||
+  'local';
+
 // =====================================================
-// 1. STORAGE
+// 2. LEARNING CONFIGURATION
 // =====================================================
+
+const LEARNING = {
+  // Bayesian prior mạnh hơn để tránh phản ứng quá nhanh
+  bayesianPrior: 20,
+  bayesianDecay: 0.99,
+
+  // Markov có prior lớn và ảnh hưởng bị giới hạn
+  markovPrior: 20,
+  markovInfluence: 0.20,
+  markovDecay: 0.995,
+
+  // Logistic
+  logisticLearningRate: 0.005,
+  logisticL2: 0.001,
+
+  // Neural
+  neuralLearningRate: 0.003,
+
+  // EWMA
+  ewmaAlpha: 0.08,
+
+  // Ensemble Log Loss
+  metaLearningRate: 0.025,
+  minWeight: 0.2,
+  maxWeight: 5,
+
+  // Giới hạn xác suất tránh dự đoán cực đoan
+  minProbability: 0.10,
+  maxProbability: 0.90
+};
+
+const ALGO_NAMES = [
+  'bayesian_online',
+  'markov_transition',
+  'online_logistic',
+  'adaptive_neural_network',
+  'ewma_online'
+];
+
+// =====================================================
+// 3. COMMON FUNCTIONS
+// =====================================================
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sigmoid(x) {
+  x = clamp(x, -25, 25);
+  return 1 / (1 + Math.exp(-x));
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 function atomicSave(file, data) {
-  const tempFile = file + '.tmp';
+  const temp = file + '.tmp';
 
   fs.writeFileSync(
-    tempFile,
+    temp,
     JSON.stringify(data, null, 2),
     'utf8'
   );
 
-  fs.renameSync(tempFile, file);
+  fs.renameSync(temp, file);
 }
+
+function removeFileIfExists(file) {
+  for (const target of [file, file + '.tmp']) {
+    if (fs.existsSync(target)) {
+      fs.unlinkSync(target);
+    }
+  }
+}
+
+// =====================================================
+// 4. DEPLOY RESET
+// =====================================================
+
+// Quy tắc:
+// - Lần chạy đầu: giữ dữ liệu cũ nếu có.
+// - Cùng commit: giữ dữ liệu.
+// - Commit mới: tạo lại history và learning state.
+// - Restart cùng commit: không xóa dữ liệu.
+
+function handleDeployReset() {
+  let previous = null;
+
+  try {
+    if (fs.existsSync(DEPLOY_MARKER)) {
+      previous = JSON.parse(
+        fs.readFileSync(DEPLOY_MARKER, 'utf8')
+      );
+    }
+  } catch (err) {
+    console.error('[DEPLOY MARKER]', err.message);
+  }
+
+  if (
+    previous &&
+    previous.deployId &&
+    previous.deployId !== DEPLOY_ID
+  ) {
+    console.log('[DEPLOY] New commit detected');
+    console.log('[DEPLOY] Resetting history and learning weights');
+
+    removeFileIfExists(DATA_FILE);
+    removeFileIfExists(LEARNING_FILE);
+
+    console.log('[DEPLOY] Old data removed');
+  } else if (!previous) {
+    console.log('[DEPLOY] First marker creation');
+    console.log('[DEPLOY] Existing data will be preserved');
+  } else {
+    console.log('[DEPLOY] Same commit - keeping saved data');
+  }
+
+  atomicSave(DEPLOY_MARKER, {
+    deployId: DEPLOY_ID,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+// =====================================================
+// 5. HISTORY STORAGE
+// =====================================================
 
 function initDataFile() {
   if (!fs.existsSync(DATA_FILE)) {
     atomicSave(DATA_FILE, []);
     console.log('[INIT] Created history file');
-  } else {
-    console.log('[INIT] Existing history preserved');
   }
 }
 
@@ -56,16 +185,32 @@ function readHistory() {
   }
 }
 
-function writeHistory(data) {
-  atomicSave(DATA_FILE, data);
+function writeHistory(history) {
+  atomicSave(DATA_FILE, history);
 }
 
-function cloneObject(obj) {
-  return JSON.parse(JSON.stringify(obj));
+function mergeHistory(oldHistory, newSessions) {
+  const map = new Map();
+
+  for (const item of oldHistory) {
+    const id = Number(item?.id);
+
+    if (Number.isFinite(id)) {
+      map.set(id, item);
+    }
+  }
+
+  for (const item of newSessions) {
+    map.set(Number(item.id), item);
+  }
+
+  return [...map.values()]
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .slice(-MAX_HISTORY);
 }
 
 // =====================================================
-// 2. SOURCE API
+// 6. SOURCE API
 // =====================================================
 
 async function fetchSource() {
@@ -99,11 +244,12 @@ function normalizeSession(raw) {
     ? rawDices.map(Number).filter(Number.isFinite)
     : [];
 
-  const rawSum = Number(raw.sum ?? 0);
-
-  const sum = dices.length
+  const sumFromDice = dices.length
     ? dices.reduce((a, b) => a + b, 0)
-    : rawSum;
+    : 0;
+
+  const sum = sumFromDice ||
+    safeNumber(raw.sum, 0);
 
   const sourceResult = String(
     raw.resultTruyenThong ??
@@ -113,13 +259,9 @@ function normalizeSession(raw) {
 
   let result;
 
-  if (
-    ['TAI', 'TÀI', 'BIG'].includes(sourceResult)
-  ) {
+  if (['TAI', 'TÀI', 'BIG'].includes(sourceResult)) {
     result = 1;
-  } else if (
-    ['XIU', 'XỈU', 'SMALL'].includes(sourceResult)
-  ) {
+  } else if (['XIU', 'XỈU', 'SMALL'].includes(sourceResult)) {
     result = 0;
   } else {
     result = sum >= 11 ? 1 : 0;
@@ -134,118 +276,75 @@ function normalizeSession(raw) {
 }
 
 // =====================================================
-// 3. LEARNING CONFIGURATION
-// =====================================================
-
-const LEARNING = {
-  initialWeight: 1,
-  minWeight: 0.1,
-  maxWeight: 10,
-
-  // Ensemble Log Loss
-  metaLearningRate: 0.04,
-
-  // Giảm tốc độ học Logistic
-  logisticLearningRate: 0.015,
-
-  // Giảm tốc độ cập nhật Neural Network
-  neuralLearningRate: 0.01,
-
-  // Bayesian thích nghi dữ liệu mới
-  bayesianDecay: 0.985,
-
-  // Markov transition decay
-  markovDecay: 0.99,
-
-  // EWMA
-  ewmaAlpha: 0.15
-};
-
-const ALGO_NAMES = [
-  'bayesian_online',
-  'markov_online',
-  'online_logistic',
-  'adaptive_neural_network',
-  'ewma_online'
-];
-
-// =====================================================
-// 4. INITIAL STATE
+// 7. INITIAL LEARNING STATE
 // =====================================================
 
 function createLearningState() {
   return {
-    version: 2,
+    version: 3,
+
     initialized: false,
     lastProcessedId: null,
 
-    // Bayesian
     bayesian: {
-      alpha: 2,
-      beta: 2
+      alpha: LEARNING.bayesianPrior,
+      beta: LEARNING.bayesianPrior
     },
 
-    // Markov: hàng là kết quả trước
-    // cột 0 = Xỉu, cột 1 = Tài
+    // Markov:
+    // transitions[0] = phiên trước Xỉu
+    // transitions[1] = phiên trước Tài
+    // cột 0 = Xỉu tiếp theo
+    // cột 1 = Tài tiếp theo
     markov: {
       transitions: [
-        [2, 2],
-        [2, 2]
+        [LEARNING.markovPrior, LEARNING.markovPrior],
+        [LEARNING.markovPrior, LEARNING.markovPrior]
       ]
     },
 
-    // Logistic
     logistic: {
       weights: [0, 0, 0, 0]
     },
 
-    // Neural Network
     neural: {
-      inputSize: 4,
-
       hidden: [
-        [0.12, -0.08, 0.05, 0.10],
-        [-0.06, 0.11, 0.08, -0.04],
-        [0.09, 0.04, -0.12, 0.07],
-        [-0.10, 0.06, 0.03, 0.12]
+        [0.05, -0.03, 0.04, 0.02],
+        [-0.04, 0.03, 0.02, -0.05],
+        [0.03, 0.04, -0.03, 0.02],
+        [-0.02, 0.05, -0.04, 0.03]
       ],
 
-      output: [0.1, -0.1, 0.08, 0.05],
+      output: [0.03, -0.02, 0.02, 0.01],
       bias: 0
     },
 
-    // EWMA
     ewma: {
       value: 0.5
     },
 
-    // Ensemble weights
     metaWeights: [1, 1, 1, 1, 1],
 
-    // Context chỉ chứa kết quả đã học
     recent: [],
 
-    // Chống học trùng
     processedIds: [],
-
-    // Hàng đợi phiên chưa học
     pendingSessions: [],
 
     stats: {
       total: 0,
       hits: 0,
-      lastAccuracy: 0
+      lastAccuracy: 0,
+      logLoss: 0
     }
   };
 }
 
 // =====================================================
-// 5. LOAD AND MIGRATE LEARNING STATE
+// 8. LOAD AND MIGRATE STATE
 // =====================================================
 
 function loadLearningState() {
   if (!fs.existsSync(LEARNING_FILE)) {
-    console.log('[LEARNING] Creating new state');
     return createLearningState();
   }
 
@@ -254,13 +353,8 @@ function loadLearningState() {
       fs.readFileSync(LEARNING_FILE, 'utf8')
     );
 
-    if (!old || typeof old !== 'object') {
-      throw new Error('Invalid learning state');
-    }
-
     const base = createLearningState();
 
-    // Không làm mất dữ liệu học phiên bản cũ
     if (old.bayesian) {
       base.bayesian = {
         ...base.bayesian,
@@ -268,18 +362,11 @@ function loadLearningState() {
       };
     }
 
-    if (old.logistic?.weights?.length === 4) {
-      base.logistic.weights = old.logistic.weights;
-    }
-
     if (
-      Array.isArray(old.neural?.hidden) &&
-      old.neural.hidden.length === 4
+      Array.isArray(old.logistic?.weights) &&
+      old.logistic.weights.length === 4
     ) {
-      base.neural = {
-        ...base.neural,
-        ...old.neural
-      };
+      base.logistic.weights = old.logistic.weights;
     }
 
     if (old.ewma) {
@@ -290,11 +377,31 @@ function loadLearningState() {
     }
 
     if (
+      Array.isArray(old.neural?.hidden) &&
+      old.neural.hidden.length === 4 &&
+      Array.isArray(old.neural?.output) &&
+      old.neural.output.length === 4
+    ) {
+      base.neural = old.neural;
+    }
+
+    if (
+      Array.isArray(old.markov?.transitions) &&
+      old.markov.transitions.length === 2
+    ) {
+      base.markov = old.markov;
+    }
+
+    if (
       Array.isArray(old.metaWeights) &&
       old.metaWeights.length === 5
     ) {
       base.metaWeights = old.metaWeights.map(w =>
-        clamp(Number(w) || 1, LEARNING.minWeight, LEARNING.maxWeight)
+        clamp(
+          safeNumber(w, 1),
+          LEARNING.minWeight,
+          LEARNING.maxWeight
+        )
       );
     }
 
@@ -304,6 +411,15 @@ function loadLearningState() {
         .slice(-MAX_CONTEXT);
     }
 
+    if (Array.isArray(old.processedIds)) {
+      base.processedIds =
+        old.processedIds.slice(-MAX_PROCESSED_IDS);
+    }
+
+    if (Array.isArray(old.pendingSessions)) {
+      base.pendingSessions = old.pendingSessions;
+    }
+
     if (old.stats) {
       base.stats = {
         ...base.stats,
@@ -311,35 +427,17 @@ function loadLearningState() {
       };
     }
 
-    // Giữ Markov nếu đã tồn tại
-    if (
-      Array.isArray(old.markov?.transitions) &&
-      old.markov.transitions.length === 2
-    ) {
-      base.markov = old.markov;
-    }
-
-    base.version = 2;
     base.initialized = Boolean(old.initialized);
     base.lastProcessedId = old.lastProcessedId ?? null;
-
-    base.processedIds = Array.isArray(old.processedIds)
-      ? old.processedIds.slice(-MAX_PROCESSED_IDS)
-      : [];
-
-    base.pendingSessions = Array.isArray(old.pendingSessions)
-      ? old.pendingSessions
-      : [];
-
-    console.log('[LEARNING] State loaded/migrated');
+    base.version = 3;
 
     return base;
 
   } catch (err) {
     console.error('[LEARNING LOAD]', err.message);
+    console.error('[LEARNING] Using fresh in-memory state');
 
-    // Không xóa file cũ khi đọc lỗi.
-    // Khởi tạo trạng thái mới trong bộ nhớ.
+    // Không tự xóa file lỗi để tránh mất dữ liệu cũ.
     return createLearningState();
   }
 }
@@ -351,83 +449,67 @@ function saveLearningState() {
 }
 
 // =====================================================
-// 6. COMMON FUNCTIONS
+// 9. FEATURE ENGINEERING
 // =====================================================
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function sigmoid(x) {
-  x = clamp(x, -30, 30);
-  return 1 / (1 + Math.exp(-x));
-}
-
-function makePrediction(pTai) {
-  const p = clamp(
-    Number.isFinite(pTai) ? pTai : 0.5,
-    0.01,
-    0.99
-  );
-
-  return {
-    pick: p >= 0.5 ? 1 : 0,
-    pTai: p
-  };
-}
-
-// =====================================================
-// 7. FEATURE ENGINEERING
-// =====================================================
+// Không sử dụng streak.
+// Không sử dụng quy tắc "bệt".
+// Không có feature đặc biệt cho tổng 11.
+//
+// Các feature chỉ mô tả thống kê tổng hợp.
+// Chúng không được xem là tín hiệu chắc chắn cho phiên sau.
 
 function getFeatures(state) {
   const recent = state.recent || [];
 
-  const last = recent.length
-    ? recent[recent.length - 1]
+  const ewma = state.ewma.value;
+
+  const mean = recent.length
+    ? recent.reduce((a, b) => a + b, 0) / recent.length
     : 0.5;
 
-  let streak = 0;
+  let changes = 0;
 
-  if (recent.length) {
-    const current = recent[recent.length - 1];
-
-    for (let i = recent.length - 1; i >= 0; i--) {
-      if (recent[i] !== current) break;
-      streak++;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i] !== recent[i - 1]) {
+      changes++;
     }
-
-    streak *= current === 1 ? 1 : -1;
   }
+
+  const changeRate = recent.length > 1
+    ? changes / (recent.length - 1)
+    : 0.5;
 
   return [
     1,
-    last * 2 - 1,
-    (state.ewma.value - 0.5) * 2,
-    clamp(streak / 10, -1, 1)
+    clamp((ewma - 0.5) * 2, -1, 1),
+    clamp((mean - 0.5) * 2, -1, 1),
+    clamp((changeRate - 0.5) * 2, -1, 1)
   ];
 }
 
 // =====================================================
-// 8. ALGORITHM 1: BAYESIAN WITH DECAY
+// 10. ALGORITHM 1: BAYESIAN
 // =====================================================
 
 function algoBayesian(state) {
   const a = state.bayesian.alpha;
   const b = state.bayesian.beta;
 
-  return makePrediction(a / (a + b));
+  return a + b > 0
+    ? a / (a + b)
+    : 0.5;
 }
 
 function updateBayesian(state, actual) {
+  const prior = LEARNING.bayesianPrior;
   const decay = LEARNING.bayesianDecay;
 
-  // Co số liệu cũ về prior 2,2
   state.bayesian.alpha =
-    2 + (state.bayesian.alpha - 2) * decay;
+    prior + (state.bayesian.alpha - prior) * decay;
 
   state.bayesian.beta =
-    2 + (state.bayesian.beta - 2) * decay;
+    prior + (state.bayesian.beta - prior) * decay;
 
   if (actual === 1) {
     state.bayesian.alpha++;
@@ -437,15 +519,13 @@ function updateBayesian(state, actual) {
 }
 
 // =====================================================
-// 9. ALGORITHM 2: MARKOV TRANSITION MODEL
+// 11. ALGORITHM 2: MARKOV
 // =====================================================
 
 function algoMarkov(state) {
   const recent = state.recent;
 
-  if (!recent.length) {
-    return makePrediction(0.5);
-  }
+  if (!recent.length) return 0.5;
 
   const previous = recent[recent.length - 1];
 
@@ -453,29 +533,34 @@ function algoMarkov(state) {
 
   const total = row[0] + row[1];
 
-  if (!total) {
-    return makePrediction(0.5);
-  }
+  const rawProbability = total > 0
+    ? row[1] / total
+    : 0.5;
 
-  return makePrediction(row[1] / total);
+  // Co xác suất về 50%.
+  // Markov chỉ được đóng góp tối đa 20% độ lệch.
+  const shrunk =
+    0.5 + (rawProbability - 0.5) *
+    LEARNING.markovInfluence;
+
+  return shrunk;
 }
 
 function updateMarkov(state, actual) {
   const recent = state.recent;
 
-  // Không có kết quả trước để xác định chuyển trạng thái
   if (!recent.length) return;
 
   const previous = recent[recent.length - 1];
 
   const transitions = state.markov.transitions;
+  const prior = LEARNING.markovPrior;
   const decay = LEARNING.markovDecay;
 
-  // Decay về prior, không để dữ liệu cũ chi phối mãi
   for (let i = 0; i < 2; i++) {
     for (let j = 0; j < 2; j++) {
       transitions[i][j] =
-        2 + (transitions[i][j] - 2) * decay;
+        prior + (transitions[i][j] - prior) * decay;
     }
   }
 
@@ -483,7 +568,7 @@ function updateMarkov(state, actual) {
 }
 
 // =====================================================
-// 10. ALGORITHM 3: ONLINE LOGISTIC
+// 12. ALGORITHM 3: LOGISTIC
 // =====================================================
 
 function algoLogistic(state) {
@@ -496,7 +581,7 @@ function algoLogistic(state) {
     z += features[i] * weights[i];
   }
 
-  return makePrediction(sigmoid(z));
+  return sigmoid(z);
 }
 
 function updateLogistic(state, actual, features) {
@@ -512,15 +597,17 @@ function updateLogistic(state, actual, features) {
   const error = actual - prediction;
 
   for (let i = 0; i < weights.length; i++) {
+    const gradient =
+      error * features[i] -
+      LEARNING.logisticL2 * weights[i];
+
     weights[i] +=
-      LEARNING.logisticLearningRate *
-      error *
-      features[i];
+      LEARNING.logisticLearningRate * gradient;
   }
 }
 
 // =====================================================
-// 11. ALGORITHM 4: ADAPTIVE NEURAL NETWORK
+// 13. ALGORITHM 4: NEURAL NETWORK
 // =====================================================
 
 function neuralForward(state, features) {
@@ -544,15 +631,14 @@ function neuralForward(state, features) {
 
   return {
     hiddenValues,
-    output: sigmoid(output)
+    probability: sigmoid(output)
   };
 }
 
 function algoNeural(state) {
   const features = getFeatures(state);
-  const forward = neuralForward(state, features);
 
-  return makePrediction(forward.output);
+  return neuralForward(state, features).probability;
 }
 
 function updateNeural(state, actual, features) {
@@ -560,29 +646,24 @@ function updateNeural(state, actual, features) {
 
   const forward = neuralForward(state, features);
 
-  const hiddenValues = forward.hiddenValues;
-  const prediction = forward.output;
+  const hidden = forward.hiddenValues;
+  const prediction = forward.probability;
 
   const error = actual - prediction;
-
-  // Lưu trọng số cũ trước khi cập nhật
   const oldOutput = [...neural.output];
 
-  // Output layer
   for (let i = 0; i < neural.output.length; i++) {
     neural.output[i] +=
       LEARNING.neuralLearningRate *
       error *
-      hiddenValues[i];
+      hidden[i];
   }
 
   neural.bias +=
     LEARNING.neuralLearningRate * error;
 
-  // Hidden layer
   for (let h = 0; h < neural.hidden.length; h++) {
-    const derivative =
-      1 - hiddenValues[h] * hiddenValues[h];
+    const derivative = 1 - hidden[h] * hidden[h];
 
     const hiddenError =
       error * oldOutput[h] * derivative;
@@ -597,11 +678,11 @@ function updateNeural(state, actual, features) {
 }
 
 // =====================================================
-// 12. ALGORITHM 5: EWMA ONLINE
+// 14. ALGORITHM 5: EWMA
 // =====================================================
 
 function algoEWMA(state) {
-  return makePrediction(state.ewma.value);
+  return state.ewma.value;
 }
 
 function updateEWMA(state, actual) {
@@ -613,7 +694,7 @@ function updateEWMA(state, actual) {
 }
 
 // =====================================================
-// 13. REGISTER FIVE ALGORITHMS
+// 15. INDEPENDENT ALGORITHM PREDICTIONS
 // =====================================================
 
 const ALGOS = [
@@ -627,53 +708,49 @@ const ALGOS = [
 function getAlgoPredictions(state) {
   return ALGOS.map(algo => {
     try {
-      return algo.fn(state);
+      return clamp(
+        algo.fn(state),
+        LEARNING.minProbability,
+        LEARNING.maxProbability
+      );
     } catch (err) {
       console.error('[ALGO ERROR]', algo.name, err.message);
-      return makePrediction(0.5);
+      return 0.5;
     }
   });
 }
 
 // =====================================================
-// 14. ENSEMBLE: LOG LOSS
+// 16. ENSEMBLE
 // =====================================================
 
 function combinePredictions(predictions, weights) {
-  let total = 0;
-  let weightTotal = 0;
+  let weighted = 0;
+  let totalWeight = 0;
 
   for (let i = 0; i < predictions.length; i++) {
-    const weight = Number(weights[i]) || 0;
+    const weight = safeNumber(weights[i], 1);
 
-    total += predictions[i].pTai * weight;
-    weightTotal += weight;
+    weighted += predictions[i] * weight;
+    totalWeight += weight;
   }
 
-  return weightTotal > 0
-    ? total / weightTotal
-    : 0.5;
+  if (!totalWeight) return 0.5;
+
+  return weighted / totalWeight;
 }
 
 function updateMetaWeights(predictions, actual, state) {
   const weights = state.metaWeights;
-
-  // Log Loss của dự đoán ngẫu nhiên 50/50
   const baselineLoss = Math.log(2);
 
   for (let i = 0; i < predictions.length; i++) {
-    const p = clamp(
-      predictions[i].pTai,
-      0.01,
-      0.99
-    );
+    const p = clamp(predictions[i], 0.01, 0.99);
 
     const loss = actual === 1
       ? -Math.log(p)
       : -Math.log(1 - p);
 
-    // Mô hình có Log Loss thấp hơn baseline
-    // sẽ được tăng trọng số tương đối.
     const factor = Math.exp(
       -LEARNING.metaLearningRate *
       (loss - baselineLoss)
@@ -688,18 +765,15 @@ function updateMetaWeights(predictions, actual, state) {
 }
 
 // =====================================================
-// 15. ONLINE LEARNING ENGINE
+// 17. ONLINE LEARNING
 // =====================================================
-
-// Chỉ học phiên mới.
-// Dự đoán được tính trước khi cập nhật bằng kết quả thực tế.
 
 function learnFromNewResult(actual) {
   const state = learningState;
 
   const features = getFeatures(state);
 
-  // Dự đoán trước khi biết kết quả
+  // Tính toàn bộ dự đoán trước khi nhìn kết quả thật.
   const predictions = getAlgoPredictions(state);
 
   const ensembleP = combinePredictions(
@@ -709,7 +783,13 @@ function learnFromNewResult(actual) {
 
   const predicted = ensembleP >= 0.5 ? 1 : 0;
 
-  // Thống kê hiệu suất thực tế
+  // Log Loss thực tế của ensemble
+  const safeP = clamp(ensembleP, 0.01, 0.99);
+
+  const loss = actual === 1
+    ? -Math.log(safeP)
+    : -Math.log(1 - safeP);
+
   state.stats.total++;
 
   if (predicted === actual) {
@@ -717,18 +797,20 @@ function learnFromNewResult(actual) {
   }
 
   state.stats.lastAccuracy =
-    state.stats.total > 0
-      ? state.stats.hits / state.stats.total
-      : 0;
+    state.stats.hits / state.stats.total;
 
-  // Cập nhật trọng số ensemble bằng Log Loss
+  state.stats.logLoss +=
+    (loss - state.stats.logLoss) /
+    state.stats.total;
+
+  // Meta-learning
   updateMetaWeights(
     predictions,
     actual,
     state
   );
 
-  // Cập nhật từng mô hình
+  // Học từng thuật toán
   updateBayesian(state, actual);
 
   updateMarkov(state, actual);
@@ -750,7 +832,7 @@ function learnFromNewResult(actual) {
     actual
   );
 
-  // Chỉ thêm kết quả sau khi đã học
+  // Chỉ cập nhật context sau khi học
   state.recent.push(actual);
 
   if (state.recent.length > MAX_CONTEXT) {
@@ -758,110 +840,68 @@ function learnFromNewResult(actual) {
   }
 
   console.log(
-    `[LEARNING] Actual=${actual} | ` +
-    `Prediction=${predicted} | ` +
-    `Accuracy=${(state.stats.lastAccuracy * 100).toFixed(2)}%`
+    `[LEARN] Actual=${actual} ` +
+    `Prediction=${predicted} ` +
+    `Accuracy=${(state.stats.lastAccuracy * 100).toFixed(2)}% ` +
+    `LogLoss=${state.stats.logLoss.toFixed(4)}`
   );
 }
 
 // =====================================================
-// 16. PREDICTION ENGINE
+// 18. PREDICTION ENGINE
 // =====================================================
 
 function ensemblePredict() {
-  const state = learningState || createLearningState();
+  const state = learningState;
 
   const predictions = getAlgoPredictions(state);
 
-  const pTai = combinePredictions(
-    predictions,
-    state.metaWeights
+  const pTai = clamp(
+    combinePredictions(
+      predictions,
+      state.metaWeights
+    ),
+    LEARNING.minProbability,
+    LEARNING.maxProbability
   );
 
   const pick = pTai >= 0.5 ? 1 : 0;
 
   const agreement = predictions.filter(
-    p => (p.pTai >= 0.5) === (pTai >= 0.5)
+    p => (p >= 0.5) === (pick === 1)
   ).length;
-
-  const accuracy = state.stats.lastAccuracy || 0;
-
-  // Chỉ là chỉ số tham khảo, không phải xác suất thắng.
-  const confidence = clamp(
-    50 + Math.max(0, accuracy - 0.5) * 50,
-    50,
-    75
-  );
 
   return {
     pick,
+    pTai,
 
-    confidence: Math.round(confidence * 100) / 100,
-
-    pTai: Math.round(pTai * 10000) / 10000,
+    pXiu: 1 - pTai,
 
     agreement: `${agreement}/${ALGOS.length}`,
 
     historicalAccuracy:
-      Math.round(accuracy * 10000) / 100,
+      state.stats.lastAccuracy || 0,
 
-    trainedSamples: state.stats.total,
+    trainedSamples:
+      state.stats.total,
+
+    logLoss:
+      state.stats.logLoss,
 
     algorithms: ALGOS.map((algo, index) => ({
       name: algo.name,
-      pick: predictions[index].pick,
 
-      probabilityTai:
-        Math.round(predictions[index].pTai * 10000) / 10000,
+      pTai: predictions[index],
 
-      weight:
-        Math.round(state.metaWeights[index] * 10000) / 10000
+      pick: predictions[index] >= 0.5 ? 1 : 0,
+
+      weight: state.metaWeights[index]
     }))
   };
 }
 
 // =====================================================
-// 17. VIETNAM TIME
-// =====================================================
-
-function formatTimeVN() {
-  const now = new Date(
-    Date.now() + 7 * 3600 * 1000
-  );
-
-  return now.toISOString().replace(
-    'Z',
-    '+07:00'
-  );
-}
-
-// =====================================================
-// 18. HISTORY MERGE
-// =====================================================
-
-function mergeHistory(oldHistory, newSessions) {
-  const map = new Map();
-
-  for (const item of oldHistory) {
-    if (
-      item &&
-      Number.isFinite(Number(item.id))
-    ) {
-      map.set(Number(item.id), item);
-    }
-  }
-
-  for (const item of newSessions) {
-    map.set(Number(item.id), item);
-  }
-
-  return [...map.values()]
-    .sort((a, b) => Number(a.id) - Number(b.id))
-    .slice(-MAX_HISTORY);
-}
-
-// =====================================================
-// 19. PENDING QUEUE
+// 19. PENDING SESSION QUEUE
 // =====================================================
 
 function addPendingSessions(sessions) {
@@ -871,7 +911,7 @@ function addPendingSessions(sessions) {
     state.pendingSessions.map(s => Number(s.id))
   );
 
-  const processed = new Set(
+  const processedIds = new Set(
     state.processedIds.map(Number)
   );
 
@@ -883,7 +923,7 @@ function addPendingSessions(sessions) {
     if (
       !Number.isFinite(id) ||
       pendingIds.has(id) ||
-      processed.has(id)
+      processedIds.has(id)
     ) {
       continue;
     }
@@ -900,20 +940,6 @@ function addPendingSessions(sessions) {
   return added;
 }
 
-// =====================================================
-// 20. PROCESS PENDING SESSIONS SAFELY
-// =====================================================
-
-// Mỗi phiên được lưu trạng thái học và processedIds
-// trong cùng một lần atomicSave.
-//
-// Nếu server chết trước khi lưu:
-// phiên vẫn còn trong hàng đợi và sẽ được học lại
-// từ trạng thái cũ.
-//
-// Nếu server chết sau khi lưu:
-// phiên đã nằm trong processedIds nên không học trùng.
-
 function processPendingSessions() {
   while (learningState.pendingSessions.length > 0) {
     const session = learningState.pendingSessions[0];
@@ -925,14 +951,15 @@ function processPendingSessions() {
       !Number.isFinite(id) ||
       ![0, 1].includes(actual)
     ) {
-      const candidate = cloneObject(learningState);
+      const candidate = JSON.parse(
+        JSON.stringify(learningState)
+      );
 
       candidate.pendingSessions.shift();
 
       atomicSave(LEARNING_FILE, candidate);
       learningState = candidate;
 
-      console.error('[LEARNING] Removed invalid pending session');
       continue;
     }
 
@@ -941,7 +968,9 @@ function processPendingSessions() {
         .map(Number)
         .includes(id)
     ) {
-      const candidate = cloneObject(learningState);
+      const candidate = JSON.parse(
+        JSON.stringify(learningState)
+      );
 
       candidate.pendingSessions =
         candidate.pendingSessions.filter(
@@ -954,11 +983,11 @@ function processPendingSessions() {
       continue;
     }
 
-    // Thao tác trên bản sao để tránh thay đổi state
-    // trong bộ nhớ nếu việc lưu file thất bại.
-    const candidate = cloneObject(learningState);
+    const previous = learningState;
 
-    const previousState = learningState;
+    const candidate = JSON.parse(
+      JSON.stringify(previous)
+    );
 
     learningState = candidate;
 
@@ -967,36 +996,36 @@ function processPendingSessions() {
 
       candidate.processedIds.push(id);
 
-      if (
-        candidate.processedIds.length > MAX_PROCESSED_IDS
-      ) {
-        candidate.processedIds =
-          candidate.processedIds.slice(-MAX_PROCESSED_IDS);
-      }
+      candidate.processedIds =
+        candidate.processedIds.slice(-MAX_PROCESSED_IDS);
 
       candidate.lastProcessedId =
         candidate.lastProcessedId === null
           ? id
-          : Math.max(Number(candidate.lastProcessedId), id);
+          : Math.max(
+              Number(candidate.lastProcessedId),
+              id
+            );
 
       candidate.pendingSessions =
         candidate.pendingSessions.filter(
           s => Number(s.id) !== id
         );
 
+      // Lưu model và processedIds cùng một lần.
       atomicSave(LEARNING_FILE, candidate);
 
       learningState = candidate;
 
     } catch (err) {
-      learningState = previousState;
+      learningState = previous;
       throw err;
     }
   }
 }
 
 // =====================================================
-// 21. SOURCE SYNC + ONLINE LEARNING
+// 20. SYNC ENGINE
 // =====================================================
 
 let syncInProgress = false;
@@ -1014,13 +1043,13 @@ async function syncData() {
       : raw.data ?? raw.sessions ?? raw.list ?? [];
 
     if (!Array.isArray(list)) {
-      throw new Error('Invalid source data');
+      throw new Error('Invalid source response');
     }
 
     const history = readHistory();
 
     const knownIds = new Set(
-      history.map(h => Number(h.id))
+      history.map(s => Number(s.id))
     );
 
     const newSessions = [];
@@ -1044,19 +1073,15 @@ async function syncData() {
       newSessions.push(session);
     }
 
-    // -------------------------------------------------
-    // FIRST STARTUP
-    // -------------------------------------------------
-
+    // Lần khởi động đầu tiên:
+    // chỉ thiết lập mốc, không học lịch sử cũ.
     if (!learningState.initialized) {
       const merged = mergeHistory(
         history,
         newSessions
       );
 
-      if (newSessions.length > 0) {
-        writeHistory(merged);
-      }
+      writeHistory(merged);
 
       const latest = merged.length
         ? Math.max(...merged.map(s => Number(s.id)))
@@ -1065,33 +1090,25 @@ async function syncData() {
       learningState.initialized = true;
       learningState.lastProcessedId = latest;
 
-      // Không học lịch sử cũ.
       learningState.pendingSessions = [];
       learningState.processedIds = [];
 
       saveLearningState();
 
-      console.log('[LEARNING] Initial baseline established');
-      console.log('[LEARNING] Old history NOT used for training');
+      console.log('[LEARNING] Baseline established');
+      console.log('[LEARNING] Old history not trained');
 
       return;
     }
 
-    // -------------------------------------------------
-    // PERSIST QUEUE BEFORE HISTORY
-    // -------------------------------------------------
-
+    // Lưu queue trước khi ghi history.
     const added = addPendingSessions(newSessions);
 
     if (added > 0) {
-      // Lưu hàng đợi trước khi ghi lịch sử.
       saveLearningState();
     }
 
-    // -------------------------------------------------
-    // SAVE HISTORY
-    // -------------------------------------------------
-
+    // Cập nhật lịch sử
     if (newSessions.length > 0) {
       const merged = mergeHistory(
         history,
@@ -1101,22 +1118,13 @@ async function syncData() {
       writeHistory(merged);
 
       console.log(
-        `[SYNC] +${newSessions.length} sessions | Total ${merged.length}`
+        `[SYNC] Added ${newSessions.length} sessions`
       );
     }
 
-    // -------------------------------------------------
-    // PROCESS PENDING QUEUE
-    // -------------------------------------------------
-
+    // Xử lý queue kể cả khi phiên bị nhận chậm.
     if (learningState.pendingSessions.length > 0) {
-      const before = learningState.pendingSessions.length;
-
       processPendingSessions();
-
-      console.log(
-        `[LEARNING] Queue processed: ${before} sessions`
-      );
     }
 
   } catch (err) {
@@ -1124,6 +1132,16 @@ async function syncData() {
   } finally {
     syncInProgress = false;
   }
+}
+
+// =====================================================
+// 21. VIETNAM TIME
+// =====================================================
+
+function formatTimeVN() {
+  return new Date().toLocaleString('sv-SE', {
+    timeZone: 'Asia/Ho_Chi_Minh'
+  }).replace(' ', 'T') + '+07:00';
 }
 
 // =====================================================
@@ -1164,19 +1182,23 @@ function buildResponse() {
       ? 'tai'
       : 'xiu',
 
-    dotincay: `${ens.confidence}%`,
+    dotincay:
+      `${(ens.pTai * 100).toFixed(2)}%`,
 
     xacsuattai:
       `${(ens.pTai * 100).toFixed(2)}%`,
 
     xacsuatxiu:
-      `${((1 - ens.pTai) * 100).toFixed(2)}%`,
+      `${(ens.pXiu * 100).toFixed(2)}%`,
 
     dochinhxaclichsu:
-      `${ens.historicalAccuracy}%`,
+      `${(ens.historicalAccuracy * 100).toFixed(2)}%`,
 
     solanhoctap:
       ens.trainedSamples,
+
+    logloss:
+      Number(ens.logLoss.toFixed(5)),
 
     dongthuan:
       ens.agreement,
@@ -1189,10 +1211,10 @@ function buildResponse() {
         : 'xiu',
 
       xac_suat_tai:
-        a.probabilityTai,
+        Number(a.pTai.toFixed(4)),
 
       trong_so:
-        a.weight
+        Number(a.weight.toFixed(4))
     })),
 
     uptime: formatTimeVN()
@@ -1246,13 +1268,41 @@ app.get('/history', (req, res) => {
   }
 });
 
+// Trạng thái mô hình
+app.get('/status', (req, res) => {
+  res.json({
+    deployId: DEPLOY_ID,
+    initialized: learningState.initialized,
+    lastProcessedId: learningState.lastProcessedId,
+    pending: learningState.pendingSessions.length,
+    trainedSamples: learningState.stats.total,
+    accuracy:
+      Number((learningState.stats.lastAccuracy * 100).toFixed(2)),
+    logLoss:
+      Number(learningState.stats.logLoss.toFixed(5)),
+    recentCount: learningState.recent.length,
+    uptime: formatTimeVN()
+  });
+});
+
 // =====================================================
-// 24. BOOT SERVER
+// 24. BOOT
 // =====================================================
+
+handleDeployReset();
 
 initDataFile();
 
 learningState = loadLearningState();
+
+console.log('[BOOT] Deploy:', DEPLOY_ID);
+console.log('[BOOT] Bayesian decay enabled');
+console.log('[BOOT] Markov shrinkage enabled');
+console.log('[BOOT] Streak feature disabled');
+console.log('[BOOT] Logistic slow learning enabled');
+console.log('[BOOT] Neural slow learning enabled');
+console.log('[BOOT] Ensemble Log Loss enabled');
+console.log('[BOOT] Persistent learning enabled');
 
 // Đồng bộ ngay khi khởi động
 syncData();
@@ -1267,19 +1317,31 @@ if (typeof syncTimer.unref === 'function') {
   syncTimer.unref();
 }
 
-app.listen(PORT, () => {
-  console.log(`[BOOT] Port ${PORT} — ${formatTimeVN()}`);
-
-  console.log(`[BOOT] ${ALGOS.length} algorithms loaded`);
-
-  console.log('[BOOT] Bayesian decay enabled');
-  console.log('[BOOT] Markov transition model enabled');
-  console.log('[BOOT] Logistic slow learning enabled');
-  console.log('[BOOT] Neural slow learning enabled');
-  console.log('[BOOT] Ensemble Log Loss enabled');
-
-  console.log('[BOOT] Persistent online learning enabled');
-
-  console.log(`[BOOT] History: ${DATA_FILE}`);
-  console.log(`[BOOT] Learning: ${LEARNING_FILE}`);
+const server = app.listen(PORT, () => {
+  console.log(`[BOOT] Server running on port ${PORT}`);
+  console.log(`[BOOT] Time: ${formatTimeVN()}`);
 });
+
+// Graceful shutdown
+function shutdown() {
+  console.log('[SHUTDOWN] Saving state');
+
+  try {
+    saveLearningState();
+  } catch (err) {
+    console.error('[SHUTDOWN SAVE]', err.message);
+  }
+
+  clearInterval(syncTimer);
+
+  server.close(() => {
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
