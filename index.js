@@ -6,11 +6,15 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
-// =====================================================
-// 1. CONFIG
-// =====================================================
+// ================== CẤU HÌNH ==================
+
+const PORT = process.env.PORT || 10000;
+const POLL_MS = 15000;
+const MAX_HISTORY = 1500;
+const MAX_FORECASTS = 500;
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
 const LEARNING_FILE = path.join(__dirname, 'learning_state.json');
@@ -18,1391 +22,847 @@ const LEARNING_FILE = path.join(__dirname, 'learning_state.json');
 const SOURCE_API =
   'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
-const PORT = Number(process.env.PORT) || 3000;
-const POLL_INTERVAL = 15000;
+// ================== TRẠNG THÁI ==================
 
-const MAX_HISTORY = 1000;
-const MAX_CONTEXT = 100;
-const MAX_PROCESSED_IDS = 5000;
-const MAX_PENDING = 1000;
-const MAX_FORECASTS = 1000;
-
-const CONFIG = {
-  globalDecay: 0.998,
-  markovDecay: 0.995,
-  patternDecay: 0.99,
-
-  logisticRate: 0.008,
-  logisticL2: 0.01,
-
-  metaRate: 0.02,
-  minWeight: 0.2,
-  maxWeight: 5,
-
-  // Markov bậc 2 chỉ được tin nhiều khi có đủ mẫu.
-  patternPrior: 10,
-
-  // Giảm xác suất cực đoan khi dữ liệu còn ít.
-  probabilityShrinkage: 0.35
+let history = [];
+let forecasts = {};
+let stats = {
+  evaluated: 0,
+  correct: 0,
+  wrong: 0
 };
 
-const ALGO_NAMES = [
-  'bayesian',
-  'markov1',
-  'markov2',
-  'logistic'
-];
+let lastSync = null;
+let lastError = null;
+let isSyncing = false;
+let startedAt = new Date().toISOString();
 
-// =====================================================
-// 2. FILE STORAGE
-// =====================================================
+// ================== HÀM CƠ BẢN ==================
 
-function atomicSave(file, data) {
-  const temp = file + '.tmp';
+function safeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
 
-  fs.writeFileSync(
-    temp,
-    JSON.stringify(data, null, 2),
-    'utf8'
+function normalizeLabel(value) {
+  if (value === null || value === undefined) return null;
+
+  const s = String(value).trim().toLowerCase();
+
+  if (
+    s === 'tai' ||
+    s === 'tài' ||
+    s === 'big' ||
+    s === 'over' ||
+    s === '1'
+  ) return 1;
+
+  if (
+    s === 'xiu' ||
+    s === 'xỉu' ||
+    s === 'small' ||
+    s === 'under' ||
+    s === '0'
+  ) return 0;
+
+  return null;
+}
+
+function getDice(obj) {
+  const possible = [
+    obj.dices,
+    obj.dice,
+    obj.xucxac,
+    obj.xuc_xac,
+    obj.rolls,
+    obj.faces
+  ];
+
+  for (const item of possible) {
+    if (Array.isArray(item)) {
+      const dice = item.map(Number);
+
+      if (
+        dice.length === 3 &&
+        dice.every(n => Number.isInteger(n) && n >= 1 && n <= 6)
+      ) {
+        return dice;
+      }
+    }
+
+    if (typeof item === 'string') {
+      const nums = item.match(/[1-6]/g);
+
+      if (nums && nums.length === 3) {
+        return nums.map(Number);
+      }
+    }
+  }
+
+  return null;
+}
+
+function normalizeSession(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+
+  const rawId =
+    obj.id ??
+    obj.session ??
+    obj.sessionId ??
+    obj.issue ??
+    obj.period ??
+    obj.round ??
+    obj.phien ??
+    obj.phienhientai;
+
+  if (rawId === undefined || rawId === null) return null;
+
+  const id = String(rawId).trim();
+  if (!id) return null;
+
+  const dice = getDice(obj);
+
+  let sum = safeNumber(
+    obj.sum ?? obj.total ?? obj.tong ?? obj.totalScore
   );
 
-  fs.renameSync(temp, file);
-}
-
-function readHistory() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) return [];
-
-    const data = JSON.parse(
-      fs.readFileSync(DATA_FILE, 'utf8') || '[]'
-    );
-
-    return Array.isArray(data) ? data : [];
-  } catch (err) {
-    console.error('[HISTORY READ]', err.message);
-    return [];
-  }
-}
-
-function writeHistory(data) {
-  atomicSave(DATA_FILE, data);
-}
-
-function initFiles() {
-  if (!fs.existsSync(DATA_FILE)) {
-    writeHistory([]);
+  if (sum === null && dice) {
+    sum = dice.reduce((a, b) => a + b, 0);
   }
 
-  if (!fs.existsSync(LEARNING_FILE)) {
-    atomicSave(LEARNING_FILE, createLearningState());
+  const rawResult =
+    obj.result ??
+    obj.ketqua ??
+    obj.outcome ??
+    obj.tx ??
+    obj.taiXiu ??
+    obj.bigSmall;
+
+  let result = normalizeLabel(rawResult);
+
+  // Nếu API không trả kết quả nhưng có tổng điểm,
+  // dùng luật thông thường: 11-17 là Tài, 4-10 là Xỉu.
+  if (result === null && sum !== null) {
+    result = sum >= 11 ? 1 : 0;
   }
-}
 
-// =====================================================
-// 3. LEARNING STATE
-// =====================================================
+  if (result === null) return null;
 
-function createLearningState() {
   return {
-    version: 3,
-    initialized: false,
-
-    baselineId: null,
-    lastProcessedId: null,
-
-    processedIds: [],
-    pendingSessions: [],
-
-    // Bayesian: alpha = Tài, beta = Xỉu.
-    global: {
-      alpha: 2,
-      beta: 2
-    },
-
-    // Markov bậc 1.
-    // Hàng là kết quả trước, cột là kết quả tiếp theo.
-    markov1: [
-      [2, 2],
-      [2, 2]
-    ],
-
-    // Markov bậc 2.
-    patterns: {},
-
-    // Logistic regression.
-    logistic: {
-      weights: [0, 0, 0, 0, 0, 0]
-    },
-
-    recent: [],
-
-    // Trọng số tự điều chỉnh.
-    metaWeights: [1, 1, 1, 1],
-
-    // Dự đoán đã phát ra cho phiên tương lai.
-    forecasts: [],
-
-    stats: {
-      trainedSamples: 0,
-
-      backtestTotal: 0,
-      backtestHits: 0,
-      backtestAccuracy: 0,
-      backtestLogLoss: 0,
-
-      liveTotal: 0,
-      liveHits: 0,
-      liveAccuracy: 0,
-      liveLogLoss: 0
-    }
+    id,
+    dice,
+    sum,
+    result,
+    label: result === 1 ? 'tai' : 'xiu',
+    timestamp: obj.timestamp || obj.time || new Date().toISOString()
   };
 }
 
-function loadLearningState() {
+function collectObjects(input, output = [], depth = 0) {
+  if (depth > 8 || input === null || input === undefined) {
+    return output;
+  }
+
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      collectObjects(item, output, depth + 1);
+    }
+    return output;
+  }
+
+  if (typeof input !== 'object') return output;
+
+  output.push(input);
+
+  for (const value of Object.values(input)) {
+    if (value && typeof value === 'object') {
+      collectObjects(value, output, depth + 1);
+    }
+  }
+
+  return output;
+}
+
+function extractSessions(payload) {
+  const objects = collectObjects(payload);
+  const found = new Map();
+
+  for (const obj of objects) {
+    const session = normalizeSession(obj);
+
+    if (session) {
+      found.set(session.id, session);
+    }
+  }
+
+  return [...found.values()].sort((a, b) => {
+    const na = Number(a.id);
+    const nb = Number(b.id);
+
+    if (Number.isFinite(na) && Number.isFinite(nb)) {
+      return na - nb;
+    }
+
+    return a.id.localeCompare(b.id);
+  });
+}
+
+function nextSessionId(id) {
+  const n = Number(id);
+
+  if (Number.isFinite(n)) return String(n + 1);
+
+  return null;
+}
+
+function sameId(a, b) {
+  return String(a) === String(b);
+}
+
+// ================== LƯU DỮ LIỆU ==================
+
+function writeJsonAtomic(file, data) {
+  const temp = file + '.tmp';
+
+  fs.writeFileSync(temp, JSON.stringify(data, null, 2));
+  fs.renameSync(temp, file);
+}
+
+function saveHistory() {
   try {
-    if (!fs.existsSync(LEARNING_FILE)) {
-      return createLearningState();
-    }
-
-    const saved = JSON.parse(
-      fs.readFileSync(LEARNING_FILE, 'utf8')
-    );
-
-    if (saved.version !== 3) {
-      console.log('[LEARNING] Reset model state: version mismatch');
-      return createLearningState();
-    }
-
-    const defaults = createLearningState();
-
-    return {
-      ...defaults,
-      ...saved,
-
-      global: {
-        ...defaults.global,
-        ...(saved.global || {})
-      },
-
-      logistic: {
-        ...defaults.logistic,
-        ...(saved.logistic || {})
-      },
-
-      stats: {
-        ...defaults.stats,
-        ...(saved.stats || {})
-      },
-
-      metaWeights:
-        Array.isArray(saved.metaWeights) &&
-        saved.metaWeights.length === 4
-          ? saved.metaWeights
-          : defaults.metaWeights,
-
-      markov1:
-        Array.isArray(saved.markov1) &&
-        saved.markov1.length === 2
-          ? saved.markov1
-          : defaults.markov1,
-
-      patterns: saved.patterns || {},
-      recent: saved.recent || [],
-      processedIds: saved.processedIds || [],
-      pendingSessions: saved.pendingSessions || [],
-      forecasts: saved.forecasts || []
-    };
+    writeJsonAtomic(DATA_FILE, history);
   } catch (err) {
-    console.error('[LEARNING LOAD]', err.message);
-    return createLearningState();
+    lastError = 'Lỗi lưu lịch sử: ' + err.message;
   }
 }
 
-let learningState;
+function saveLearning() {
+  try {
+    writeJsonAtomic(LEARNING_FILE, {
+      version: 4,
+      forecasts,
+      stats,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    lastError = 'Lỗi lưu learning: ' + err.message;
+  }
+}
 
-let syncInProgress = false;
-let lastSyncTime = null;
-let lastSyncError = null;
-let sourceSessionCount = 0;
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 
-// =====================================================
-// 4. COMMON FUNCTIONS
-// =====================================================
+      if (Array.isArray(raw)) {
+        history = raw
+          .map(normalizeSession)
+          .filter(Boolean);
+      }
+    }
+  } catch (err) {
+    console.error('[LOAD] Không đọc được history:', err.message);
+    history = [];
+  }
+
+  try {
+    if (fs.existsSync(LEARNING_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(LEARNING_FILE, 'utf8'));
+
+      if (raw && raw.version === 4) {
+        forecasts = raw.forecasts || {};
+        stats = raw.stats || stats;
+      }
+    }
+  } catch (err) {
+    console.error('[LOAD] Không đọc được learning:', err.message);
+  }
+
+  const unique = new Map();
+
+  for (const item of history) {
+    unique.set(String(item.id), item);
+  }
+
+  history = [...unique.values()].sort((a, b) => {
+    const na = Number(a.id);
+    const nb = Number(b.id);
+
+    if (Number.isFinite(na) && Number.isFinite(nb)) {
+      return na - nb;
+    }
+
+    return a.id.localeCompare(b.id);
+  });
+
+  history = history.slice(-MAX_HISTORY);
+
+  console.log('[LOAD] Lịch sử:', history.length);
+}
+
+// ================== THUẬT TOÁN ==================
+
+// Xác suất có làm mượt để tránh kết luận quá mạnh từ ít dữ liệu.
+function smoothedProbability(values, alpha = 2) {
+  let tai = 0;
+  let xiu = 0;
+
+  for (const value of values) {
+    if (value === 1) tai++;
+    else if (value === 0) xiu++;
+  }
+
+  return (tai + alpha) / (tai + xiu + alpha * 2);
+}
+
+// Trọng số gần đây giảm dần theo thời gian.
+function recentProbability(data, limit = 100) {
+  const rows = data.slice(-limit);
+
+  if (!rows.length) return 0.5;
+
+  let tai = 0;
+  let xiu = 0;
+  let weightSum = 0;
+
+  rows.forEach((row, index) => {
+    const weight = Math.pow(0.97, rows.length - 1 - index);
+
+    if (row.result === 1) tai += weight;
+    else xiu += weight;
+
+    weightSum += weight;
+  });
+
+  if (!weightSum) return 0.5;
+
+  return (tai + 1) / (tai + xiu + 2);
+}
+
+// Xác suất kết quả tiếp theo sau kết quả gần nhất.
+function markovOneProbability(data) {
+  if (data.length < 3) return 0.5;
+
+  const last = data[data.length - 1].result;
+  let tai = 0;
+  let xiu = 0;
+
+  for (let i = 0; i < data.length - 1; i++) {
+    if (data[i].result !== last) continue;
+
+    const next = data[i + 1].result;
+
+    if (next === 1) tai++;
+    else xiu++;
+  }
+
+  // Co về xác suất nền nếu số lần xuất hiện quá ít.
+  const base = recentProbability(data, 150);
+  const observed = (tai + 2 * base) / (tai + xiu + 2);
+
+  const reliability = Math.min(1, (tai + xiu) / 12);
+
+  return base * (1 - reliability) + observed * reliability;
+}
+
+// Xác suất sau cặp hai kết quả gần nhất.
+function markovTwoProbability(data) {
+  if (data.length < 4) return 0.5;
+
+  const a = data[data.length - 2].result;
+  const b = data[data.length - 1].result;
+
+  let tai = 0;
+  let xiu = 0;
+
+  for (let i = 0; i < data.length - 2; i++) {
+    if (
+      data[i].result === a &&
+      data[i + 1].result === b
+    ) {
+      if (data[i + 2].result === 1) tai++;
+      else xiu++;
+    }
+  }
+
+  const base = recentProbability(data, 150);
+  const observed = (tai + 2 * base) / (tai + xiu + 2);
+
+  const reliability = Math.min(1, (tai + xiu) / 10);
+
+  return base * (1 - reliability) + observed * reliability;
+}
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function sigmoid(value) {
-  value = clamp(value, -20, 20);
-  return 1 / (1 + Math.exp(-value));
-}
-
-function logLoss(probability, actual) {
-  const p = clamp(probability, 0.001, 0.999);
-
-  return actual === 1
-    ? -Math.log(p)
-    : -Math.log(1 - p);
-}
-
-function safeNumber(value, fallback = 0) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function resultName(result) {
-  return result === 1 ? 'tai' : 'xiu';
-}
-
-function formatTimeVN() {
-  return new Date().toLocaleString('sv-SE', {
-    timeZone: 'Asia/Ho_Chi_Minh'
-  }).replace(' ', 'T') + '+07:00';
-}
-
-// =====================================================
-// 5. NORMALIZE SOURCE DATA
-// =====================================================
-
-function normalizeSession(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-
-  const id = Number(
-    raw.id ??
-    raw.session ??
-    raw.issue ??
-    raw.phien
-  );
-
-  let rawDices =
-    raw.dices ??
-    raw.dice ??
-    raw.xucxac ??
-    (Array.isArray(raw.result) ? raw.result : []);
-
-  if (typeof rawDices === 'string') {
-    try {
-      rawDices = JSON.parse(rawDices);
-    } catch (_) {
-      rawDices = [];
-    }
-  }
-
-  const dices = Array.isArray(rawDices)
-    ? rawDices.map(Number)
-    : [];
-
-  const validDices =
-    dices.length === 3 &&
-    dices.every(n =>
-      Number.isInteger(n) && n >= 1 && n <= 6
-    );
-
-  let sum = validDices
-    ? dices.reduce((a, b) => a + b, 0)
-    : Number(
-        raw.sum ??
-        raw.total ??
-        raw.tong ??
-        0
-      );
-
-  if (
-    !Number.isFinite(id) ||
-    !Number.isFinite(sum) ||
-    sum < 3 ||
-    sum > 18
-  ) {
-    return null;
-  }
-
-  const sourceResult = String(
-    raw.resultTruyenThong ??
-    raw.bigSmall ??
-    raw.big_small ??
-    raw.big_small_result ??
-    raw.ketqua ??
-    ''
-  ).trim().toUpperCase();
-
-  let result;
-
-  if (
-    ['TAI', 'TÀI', 'BIG', '1'].includes(sourceResult)
-  ) {
-    result = 1;
-  } else if (
-    ['XIU', 'XỈU', 'SMALL', '0'].includes(sourceResult)
-  ) {
-    result = 0;
-  } else {
-    result = sum >= 11 ? 1 : 0;
-  }
-
-  return {
-    id,
-    dices: validDices ? dices : [],
-    sum,
-    result
-  };
-}
-
-// =====================================================
-// 6. FEATURES
-// =====================================================
-
-function getFeatures(state) {
-  const recent = state.recent;
-
-  const last = recent.length
-    ? recent[recent.length - 1]
-    : 0.5;
-
-  const previous = recent.length >= 2
-    ? recent[recent.length - 2]
-    : 0.5;
-
-  let streak = 0;
-
-  if (recent.length) {
-    const current = last;
-
-    for (let i = recent.length - 1; i >= 0; i--) {
-      if (recent[i] !== current) break;
-      streak++;
-    }
-  }
-
-  const signedStreak = recent.length
-    ? (last === 1 ? 1 : -1) * Math.min(streak, 6) / 6
-    : 0;
-
-  const alternating =
-    recent.length >= 3 &&
-    recent[recent.length - 1] !== recent[recent.length - 2] &&
-    recent[recent.length - 2] !== recent[recent.length - 3]
-      ? 1
-      : 0;
-
-  const recentAverage = recent.length
-    ? recent.slice(-10).reduce((a, b) => a + b, 0) /
-      Math.min(recent.length, 10)
-    : 0.5;
-
-  return [
-    1,
-    last === 1 ? 1 : -1,
-    previous === 1 ? 1 : -1,
-    signedStreak,
-    alternating,
-    (recentAverage - 0.5) * 2
-  ];
-}
-
-// =====================================================
-// 7. MODEL 1: BAYESIAN
-// =====================================================
-
-function predictBayesian(state) {
-  const total =
-    state.global.alpha + state.global.beta;
-
-  return state.global.alpha / total;
-}
-
-function updateBayesian(state, actual) {
-  const model = state.global;
-
-  model.alpha *= CONFIG.globalDecay;
-  model.beta *= CONFIG.globalDecay;
-
-  if (actual === 1) {
-    model.alpha += 1;
-  } else {
-    model.beta += 1;
-  }
-}
-
-// =====================================================
-// 8. MODEL 2: MARKOV BẬC 1
-// =====================================================
-
-function predictMarkov1(state) {
-  if (!state.recent.length) return 0.5;
-
-  const previous = state.recent[state.recent.length - 1];
-  const counts = state.markov1[previous];
-
-  return counts[1] / (counts[0] + counts[1]);
-}
-
-function updateMarkov1(state, actual) {
-  const recent = state.recent;
-
-  for (const row of state.markov1) {
-    row[0] *= CONFIG.markovDecay;
-    row[1] *= CONFIG.markovDecay;
-  }
-
-  if (!recent.length) return;
-
-  const previous = recent[recent.length - 1];
-
-  state.markov1[previous][actual] += 1;
-}
-
-// =====================================================
-// 9. MODEL 3: MARKOV BẬC 2 CÓ SHRINKAGE
-// =====================================================
-
-function predictMarkov2(state) {
-  const recent = state.recent;
-
-  if (recent.length < 2) {
-    return predictMarkov1(state);
-  }
-
-  const a = recent[recent.length - 2];
-  const b = recent[recent.length - 1];
-
-  const key = `${a}${b}`;
-  const counts = state.patterns[key];
-
-  const base = predictMarkov1(state);
-
-  if (!counts) return base;
-
-  const total = counts[0] + counts[1];
-
-  const patternProbability =
-    counts[1] / total;
-
-  // Ít mẫu thì kéo mạnh về Markov bậc 1.
-  const reliability =
-    total / (total + CONFIG.patternPrior);
-
-  return (
-    reliability * patternProbability +
-    (1 - reliability) * base
-  );
-}
-
-function updateMarkov2(state, actual) {
-  for (const key of Object.keys(state.patterns)) {
-    const counts = state.patterns[key];
-
-    counts[0] *= CONFIG.patternDecay;
-    counts[1] *= CONFIG.patternDecay;
-
-    if (counts[0] + counts[1] < 0.1) {
-      delete state.patterns[key];
-    }
-  }
-
-  const recent = state.recent;
-
-  if (recent.length < 2) return;
-
-  const a = recent[recent.length - 2];
-  const b = recent[recent.length - 1];
-
-  const key = `${a}${b}`;
-
-  if (!state.patterns[key]) {
-    state.patterns[key] = [4, 4];
-  }
-
-  state.patterns[key][actual] += 1;
-}
-
-// =====================================================
-// 10. MODEL 4: ONLINE LOGISTIC
-// =====================================================
-
-function predictLogistic(state) {
-  const features = getFeatures(state);
-  const weights = state.logistic.weights;
-
-  let z = 0;
-
-  for (let i = 0; i < features.length; i++) {
-    z += features[i] * weights[i];
-  }
-
-  return sigmoid(z);
-}
-
-function updateLogistic(state, actual, features) {
-  const weights = state.logistic.weights;
-
-  let z = 0;
-
-  for (let i = 0; i < features.length; i++) {
-    z += features[i] * weights[i];
-  }
-
-  const error = actual - sigmoid(z);
-
-  for (let i = 0; i < weights.length; i++) {
-    weights[i] += CONFIG.logisticRate * (
-      error * features[i] -
-      CONFIG.logisticL2 * weights[i]
-    );
-  }
-
-  // Giới hạn trọng số để tránh mô hình bị bùng.
-  for (let i = 0; i < weights.length; i++) {
-    weights[i] = clamp(weights[i], -3, 3);
-  }
-}
-
-// =====================================================
-// 11. MODEL ENSEMBLE
-// =====================================================
-
-function getModelPredictions(state) {
-  return [
-    predictBayesian(state),
-    predictMarkov1(state),
-    predictMarkov2(state),
-    predictLogistic(state)
-  ].map(p => clamp(p, 0.001, 0.999));
-}
-
-function combinePredictions(predictions, weights) {
-  let total = 0;
-  let totalWeight = 0;
-
-  for (let i = 0; i < predictions.length; i++) {
-    const weight = clamp(
-      safeNumber(weights[i], 1),
-      CONFIG.minWeight,
-      CONFIG.maxWeight
-    );
-
-    total += predictions[i] * weight;
-    totalWeight += weight;
-  }
-
-  return totalWeight > 0
-    ? total / totalWeight
-    : 0.5;
-}
-
-function updateMetaWeights(predictions, actual, state) {
-  const baselineLoss = Math.log(2);
-
-  for (let i = 0; i < predictions.length; i++) {
-    const loss = logLoss(predictions[i], actual);
-
-    const adjustment = Math.exp(
-      -CONFIG.metaRate * (loss - baselineLoss)
-    );
-
-    state.metaWeights[i] = clamp(
-      state.metaWeights[i] * adjustment,
-      CONFIG.minWeight,
-      CONFIG.maxWeight
-    );
-  }
-}
-
-function getEnsembleProbability(state) {
-  const predictions = getModelPredictions(state);
-
-  const rawProbability = combinePredictions(
-    predictions,
-    state.metaWeights
-  );
-
-  // Khi chưa có nhiều mẫu, không cho mô hình quá tự tin.
-  const samples = state.stats.trainedSamples;
-
-  const learningFactor = clamp(
-    samples / 150,
-    0,
-    1
-  );
-
-  const shrinkage =
-    CONFIG.probabilityShrinkage *
-    (1 - learningFactor);
-
-  const calibrated = (
-    rawProbability * (1 - shrinkage) +
-    0.5 * shrinkage
-  );
-
-  return {
-    pTai: clamp(calibrated, 0.05, 0.95),
-    modelPredictions: predictions
-  };
-}
-
-// =====================================================
-// 12. STATS
-// =====================================================
-
-function updateBacktestStats(state, probability, actual) {
-  const stats = state.stats;
-
-  stats.backtestTotal++;
-
-  if (
-    (probability >= 0.5 ? 1 : 0) === actual
-  ) {
-    stats.backtestHits++;
-  }
-
-  stats.backtestAccuracy =
-    stats.backtestHits / stats.backtestTotal;
-
-  const loss = logLoss(probability, actual);
-
-  stats.backtestLogLoss += (
-    loss - stats.backtestLogLoss
-  ) / stats.backtestTotal;
-}
-
-function updateLiveStats(state, probability, actual) {
-  const stats = state.stats;
-
-  stats.liveTotal++;
-
-  if (
-    (probability >= 0.5 ? 1 : 0) === actual
-  ) {
-    stats.liveHits++;
-  }
-
-  stats.liveAccuracy =
-    stats.liveHits / stats.liveTotal;
-
-  const loss = logLoss(probability, actual);
-
-  stats.liveLogLoss += (
-    loss - stats.liveLogLoss
-  ) / stats.liveTotal;
-}
-
-// =====================================================
-// 13. LEARN ONE RESULT
-// =====================================================
-
-function learnOneResult(actual) {
-  const state = learningState;
-
-  // Phải lấy feature và dự đoán trước khi cập nhật kết quả.
-  const features = getFeatures(state);
-  const predictions = getModelPredictions(state);
-
-  const rawProbability = combinePredictions(
-    predictions,
-    state.metaWeights
-  );
-
-  const samples = state.stats.trainedSamples;
-
-  const learningFactor = clamp(samples / 150, 0, 1);
-
-  const shrinkage =
-    CONFIG.probabilityShrinkage *
-    (1 - learningFactor);
-
-  const probability =
-    rawProbability * (1 - shrinkage) +
-    0.5 * shrinkage;
-
-  // Backtest tuần tự: dự đoán trước, biết kết quả sau.
-  updateBacktestStats(state, probability, actual);
-
-  // Điều chỉnh trọng số theo kết quả vừa biết.
-  updateMetaWeights(predictions, actual, state);
-
-  // Cập nhật các mô hình.
-  updateBayesian(state, actual);
-  updateMarkov1(state, actual);
-  updateMarkov2(state, actual);
-  updateLogistic(state, actual, features);
-
-  state.recent.push(actual);
-
-  if (state.recent.length > MAX_CONTEXT) {
-    state.recent.shift();
-  }
-
-  state.stats.trainedSamples++;
-}
-
-// =====================================================
-// 14. FORECAST LEDGER
-// =====================================================
-
-function findForecast(sessionId) {
-  return learningState.forecasts.find(
-    item => Number(item.targetId) === Number(sessionId)
-  );
-}
-
-function saveForecast(targetId, prediction) {
-  const state = learningState;
-
-  // Không ghi đè dự đoán cũ của cùng một phiên.
-  if (findForecast(targetId)) return;
-
-  state.forecasts.push({
-    targetId: Number(targetId),
-    pTai: prediction.pTai,
-    pick: prediction.pick,
-    createdAt: formatTimeVN(),
-    evaluated: false
-  });
-
-  if (state.forecasts.length > MAX_FORECASTS) {
-    state.forecasts = state.forecasts.slice(-MAX_FORECASTS);
-  }
-
-  atomicSave(LEARNING_FILE, state);
-}
-
-function evaluateForecast(session) {
-  const forecast = findForecast(session.id);
-
-  if (!forecast || forecast.evaluated) return;
-
-  updateLiveStats(
-    learningState,
-    forecast.pTai,
-    session.result
-  );
-
-  forecast.evaluated = true;
-  forecast.actual = session.result;
-  forecast.correct = forecast.pick === session.result;
-  forecast.evaluatedAt = formatTimeVN();
-
-  console.log(
-    `[LIVE SCORE] Session=${session.id} ` +
-    `Pred=${resultName(forecast.pick)} ` +
-    `Actual=${resultName(session.result)} ` +
-    `Correct=${forecast.correct}`
-  );
-}
-
-// =====================================================
-// 15. HISTORY
-// =====================================================
-
-function mergeHistory(oldHistory, newSessions) {
-  const map = new Map();
-
-  for (const item of oldHistory) {
-    if (Number.isFinite(Number(item.id))) {
-      map.set(Number(item.id), item);
-    }
-  }
-
-  for (const item of newSessions) {
-    map.set(Number(item.id), item);
-  }
-
-  return [...map.values()]
-    .sort((a, b) => Number(a.id) - Number(b.id))
-    .slice(-MAX_HISTORY);
-}
-
-// =====================================================
-// 16. QUEUE
-// =====================================================
-
-function addPendingSessions(sessions) {
-  const state = learningState;
-
-  const pendingIds = new Set(
-    state.pendingSessions.map(s => Number(s.id))
-  );
-
-  const processedIds = new Set(
-    state.processedIds.map(Number)
-  );
-
-  for (const session of sessions) {
-    if (
-      processedIds.has(session.id) ||
-      pendingIds.has(session.id)
-    ) {
-      continue;
-    }
-
-    state.pendingSessions.push(session);
-    pendingIds.add(session.id);
-  }
-
-  state.pendingSessions.sort((a, b) => a.id - b.id);
-
-  if (state.pendingSessions.length > MAX_PENDING) {
-    state.pendingSessions =
-      state.pendingSessions.slice(-MAX_PENDING);
-  }
-
-  atomicSave(LEARNING_FILE, state);
-}
-
-function processPendingSessions() {
-  const state = learningState;
-
-  state.pendingSessions.sort((a, b) => a.id - b.id);
-
-  while (state.pendingSessions.length) {
-    const session = state.pendingSessions[0];
-
-    if (
-      state.processedIds.includes(Number(session.id))
-    ) {
-      state.pendingSessions.shift();
-      atomicSave(LEARNING_FILE, state);
-      continue;
-    }
-
-    // Đánh giá dự đoán thực tế trước khi học kết quả.
-    evaluateForecast(session);
-
-    // Học kết quả mới theo thứ tự thời gian.
-    learnOneResult(session.result);
-
-    state.processedIds.push(Number(session.id));
-
-    if (state.processedIds.length > MAX_PROCESSED_IDS) {
-      state.processedIds =
-        state.processedIds.slice(-MAX_PROCESSED_IDS);
-    }
-
-    state.lastProcessedId = Number(session.id);
-
-    state.pendingSessions.shift();
-
-    atomicSave(LEARNING_FILE, state);
-  }
-}
-
-// =====================================================
-// 17. WARMUP FROM HISTORY
-// =====================================================
-
-function warmupFromHistory(sessions) {
-  const state = learningState;
-
-  console.log(
-    `[WARMUP] Training from ${sessions.length} historical sessions`
-  );
-
-  // Reset model trước khi học lại.
-  const fresh = createLearningState();
-
-  Object.assign(state, fresh);
-
-  const sorted = [...sessions].sort(
-    (a, b) => a.id - b.id
-  );
-
-  for (const session of sorted) {
-    learnOneResult(session.result);
-
-    state.processedIds.push(Number(session.id));
-    state.lastProcessedId = Number(session.id);
-  }
-
-  state.initialized = true;
-
-  state.baselineId = sorted.length
-    ? sorted[0].id
-    : null;
-
-  state.pendingSessions = [];
-
-  atomicSave(LEARNING_FILE, state);
-
-  console.log(
-    `[WARMUP DONE] Samples=${state.stats.trainedSamples}`
-  );
-}
-
-// =====================================================
-// 18. SOURCE API
-// =====================================================
-
-async function fetchSource() {
-  const response = await fetch(SOURCE_API, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'application/json',
-      'Referer': 'https://tele68.com/'
-    },
-    signal: AbortSignal.timeout(12000)
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Source API HTTP ${response.status}`
-    );
-  }
-
-  return response.json();
-}
-
-function extractSourceList(raw) {
-  if (Array.isArray(raw)) return raw;
-
-  if (Array.isArray(raw.data)) return raw.data;
-  if (Array.isArray(raw.sessions)) return raw.sessions;
-  if (Array.isArray(raw.list)) return raw.list;
-  if (Array.isArray(raw.items)) return raw.items;
-
-  if (raw.data && Array.isArray(raw.data.sessions)) {
-    return raw.data.sessions;
-  }
-
-  return [];
-}
-
-async function syncData() {
-  if (syncInProgress) return;
-
-  syncInProgress = true;
-
-  try {
-    const raw = await fetchSource();
-    const list = extractSourceList(raw);
-
-    if (!list.length) {
-      throw new Error('Source API không trả về danh sách phiên');
-    }
-
-    const sessions = list
-      .map(normalizeSession)
-      .filter(Boolean)
-      .sort((a, b) => a.id - b.id);
-
-    sourceSessionCount = sessions.length;
-
-    if (!sessions.length) {
-      throw new Error('Không có phiên hợp lệ sau khi chuẩn hóa');
-    }
-
-    const history = readHistory();
-    const merged = mergeHistory(history, sessions);
-
-    // Lần đầu hoặc model mới: học lại từ lịch sử đã có.
-    if (!learningState.initialized) {
-      writeHistory(merged);
-      warmupFromHistory(merged);
-
-      lastSyncTime = formatTimeVN();
-      lastSyncError = null;
-      return;
-    }
-
-    // Lưu hàng chờ trước khi xử lý.
-    addPendingSessions(sessions);
-
-    // Lưu lịch sử.
-    writeHistory(merged);
-
-    // Học các phiên mới.
-    processPendingSessions();
-
-    lastSyncTime = formatTimeVN();
-    lastSyncError = null;
-
-    console.log(
-      `[SYNC] History=${merged.length} ` +
-      `Trained=${learningState.stats.trainedSamples} ` +
-      `Pending=${learningState.pendingSessions.length}`
-    );
-
-  } catch (err) {
-    lastSyncError = err.message;
-    console.error('[SYNC ERROR]', err.message);
-  } finally {
-    syncInProgress = false;
-  }
-}
-
-// =====================================================
-// 19. PREDICTION
-// =====================================================
-
-function ensemblePredict() {
-  const state = learningState;
-
-  const result = getEnsembleProbability(state);
-
-  const pTai = result.pTai;
-  const pXiu = 1 - pTai;
-
-  const pick = pTai >= 0.5 ? 1 : 0;
-
-  const predictions = result.modelPredictions;
-
-  const agreement = predictions.filter(
-    p => (p >= 0.5) === (pick === 1)
-  ).length;
-
-  const probabilityGap = Math.abs(pTai - 0.5);
-
-  const cautious =
-    probabilityGap < 0.05 ||
-    agreement <= 2 ||
-    state.stats.trainedSamples < 50;
-
-  let level = 'THAP';
-
-  if (
-    !cautious &&
-    probabilityGap >= 0.10 &&
-    state.stats.trainedSamples >= 150
-  ) {
-    level = 'TRUNG_BINH';
-  }
-
-  return {
-    pick,
-    pTai,
-    pXiu,
-    agreement,
-    cautious,
-    level,
-
-    algorithms: ALGO_NAMES.map((name, index) => ({
-      name,
-      pTai: predictions[index],
-      pick: predictions[index] >= 0.5 ? 1 : 0,
-      weight: state.metaWeights[index]
-    }))
-  };
-}
-
-// =====================================================
-// 20. API RESPONSE
-// =====================================================
-
-function buildResponse() {
-  const history = readHistory();
-
-  if (!history.length) {
+function makePrediction(data) {
+  if (!data.length) {
     return {
-      id: 'noname09',
-      error: 'Chưa có dữ liệu, đang chờ đồng bộ',
-      uptime: formatTimeVN()
+      prediction: null,
+      probabilityTai: 0.5,
+      confidence: 50,
+      shouldBet: false,
+      reason: 'Chưa có dữ liệu'
     };
   }
 
-  const current = history[history.length - 1];
-  const prediction = ensemblePredict();
+  const globalP = smoothedProbability(
+    data.map(x => x.result),
+    3
+  );
 
-  const targetId = Number(current.id) + 1;
+  const recentP = recentProbability(data, 100);
+  const markov1 = markovOneProbability(data);
+  const markov2 = markovTwoProbability(data);
 
-  // Lưu dự đoán đầu tiên cho phiên kế tiếp.
-  saveForecast(targetId, prediction);
+  // Không để Markov lấn át xác suất nền khi mẫu nhỏ.
+  let probabilityTai =
+    globalP * 0.20 +
+    recentP * 0.35 +
+    markov1 * 0.25 +
+    markov2 * 0.20;
 
-  return {
-    id: 'noname09',
+  probabilityTai = clamp(probabilityTai, 0.05, 0.95);
 
-    phienhientai: current.id,
-    ketqua: resultName(current.result),
+  const prediction = probabilityTai >= 0.5 ? 1 : 0;
+  const confidence = Math.round(
+    Math.max(probabilityTai, 1 - probabilityTai) * 100
+  );
 
-    xucxac: current.dices,
-    tong: current.sum,
+  const enoughData = data.length >= 50;
+  const shouldBet = enoughData && confidence >= 56;
 
-    dudoanphien: targetId,
-    dudoan: resultName(prediction.pick),
+  let reason = 'Xác suất chưa đủ chênh lệch';
 
-    xacsuattai:
-      `${(prediction.pTai * 100).toFixed(2)}%`,
-
-    xacsuatxiu:
-      `${(prediction.pXiu * 100).toFixed(2)}%`,
-
-    // Đây là xác suất mô hình ước lượng,
-    // không phải tỷ lệ thắng được đảm bảo.
-    dotincay:
-      `${(Math.max(prediction.pTai, prediction.pXiu) * 100).toFixed(2)}%`,
-
-    mucdo: prediction.level,
-
-    chedo: prediction.cautious
-      ? 'THAN_TRONG'
-      : 'BINH_THUONG',
-
-    dongthuan: `${prediction.agreement}/4`,
-
-    dochinhxacbacktest:
-      `${(learningState.stats.backtestAccuracy * 100).toFixed(2)}%`,
-
-    dochinhxacthucte:
-      `${(learningState.stats.liveAccuracy * 100).toFixed(2)}%`,
-
-    solanhoc:
-      learningState.stats.trainedSamples,
-
-    soLanDuDoanDaCham:
-      learningState.stats.liveTotal,
-
-    logLossBacktest:
-      Number(
-        learningState.stats.backtestLogLoss.toFixed(5)
-      ),
-
-    logLossThucTe:
-      Number(
-        learningState.stats.liveLogLoss.toFixed(5)
-      ),
-
-    trongso: prediction.algorithms.map(a => ({
-      thuattoan: a.name,
-      du_doan: resultName(a.pick),
-      xac_suat_tai: Number(a.pTai.toFixed(4)),
-      trong_so: Number(a.weight.toFixed(4))
-    })),
-
-    luuy:
-      'Xác suất chỉ mang tính tham khảo; kết quả xúc xắc có thể độc lập và ngẫu nhiên.',
-
-    uptime: formatTimeVN()
-  };
-}
-
-// =====================================================
-// 21. STATUS
-// =====================================================
-
-function buildStatus() {
-  const history = readHistory();
+  if (!enoughData) {
+    reason = 'Cần ít nhất 50 phiên để đánh giá dữ liệu';
+  } else if (shouldBet) {
+    reason = 'Có chênh lệch xác suất trong dữ liệu lịch sử';
+  }
 
   return {
-    status: 'ok',
-    service: 'noname09',
-    serverTime: formatTimeVN(),
-
-    uptimeSeconds: Math.floor(process.uptime()),
-
-    sync: {
-      inProgress: syncInProgress,
-      lastSyncTime,
-      lastError: lastSyncError,
-      sourceSessions: sourceSessionCount,
-      pollIntervalMs: POLL_INTERVAL
-    },
-
-    files: {
-      historyExists: fs.existsSync(DATA_FILE),
-      learningExists: fs.existsSync(LEARNING_FILE),
-      historyFile: path.basename(DATA_FILE),
-      learningFile: path.basename(LEARNING_FILE)
-    },
-
-    data: {
-      historyCount: history.length,
-      latestSessionId: history.length
-        ? history[history.length - 1].id
-        : null
-    },
-
-    learning: {
-      version: learningState.version,
-      initialized: learningState.initialized,
-      baselineId: learningState.baselineId,
-      lastProcessedId: learningState.lastProcessedId,
-
-      pendingCount:
-        learningState.pendingSessions.length,
-
-      trainedSamples:
-        learningState.stats.trainedSamples,
-
-      backtest: {
-        total: learningState.stats.backtestTotal,
-        hits: learningState.stats.backtestHits,
-        accuracy: Number(
-          (learningState.stats.backtestAccuracy * 100).toFixed(2)
-        ),
-        logLoss: Number(
-          learningState.stats.backtestLogLoss.toFixed(5)
-        )
-      },
-
-      live: {
-        total: learningState.stats.liveTotal,
-        hits: learningState.stats.liveHits,
-        accuracy: Number(
-          (learningState.stats.liveAccuracy * 100).toFixed(2)
-        ),
-        logLoss: Number(
-          learningState.stats.liveLogLoss.toFixed(5)
-        )
-      },
-
-      forecasts: {
-        total: learningState.forecasts.length,
-        evaluated: learningState.forecasts.filter(
-          f => f.evaluated
-        ).length
-      },
-
-      algorithms: ALGO_NAMES.map((name, i) => ({
-        name,
-        weight: Number(
-          learningState.metaWeights[i].toFixed(4)
-        )
-      }))
+    prediction,
+    probabilityTai: Number(probabilityTai.toFixed(4)),
+    confidence,
+    shouldBet,
+    reason,
+    models: {
+      global: Number(globalP.toFixed(4)),
+      recent: Number(recentP.toFixed(4)),
+      markov1: Number(markov1.toFixed(4)),
+      markov2: Number(markov2.toFixed(4))
     }
   };
 }
 
-// =====================================================
-// 22. ROUTES
-// =====================================================
+// ================== ĐÁNH GIÁ DỰ ĐOÁN ==================
 
+function evaluateForecast(session) {
+  const forecast = forecasts[String(session.id)];
+
+  if (!forecast || forecast.evaluated) return;
+
+  const correct = forecast.prediction === session.result;
+
+  forecast.evaluated = true;
+  forecast.actual = session.result;
+  forecast.correct = correct;
+  forecast.evaluatedAt = new Date().toISOString();
+
+  stats.evaluated++;
+
+  if (correct) stats.correct++;
+  else stats.wrong++;
+
+  console.log(
+    `[EVALUATE] Phiên ${session.id}: dự đoán ${
+      forecast.prediction === 1 ? 'TÀI' : 'XỈU'
+    }, thực tế ${session.label}, ${correct ? 'ĐÚNG' : 'SAI'}`
+  );
+}
+
+function createForecast(sessionId) {
+  if (!sessionId || forecasts[String(sessionId)]) return;
+
+  const result = makePrediction(history);
+
+  if (result.prediction === null) return;
+
+  forecasts[String(sessionId)] = {
+    sessionId: String(sessionId),
+    prediction: result.prediction,
+    label: result.prediction === 1 ? 'tai' : 'xiu',
+    confidence: result.confidence,
+    shouldBet: result.shouldBet,
+    probabilityTai: result.probabilityTai,
+    models: result.models,
+    evaluated: false,
+    createdAt: new Date().toISOString()
+  };
+
+  const keys = Object.keys(forecasts);
+
+  if (keys.length > MAX_FORECASTS) {
+    keys
+      .sort((a, b) => {
+        const na = Number(a);
+        const nb = Number(b);
+
+        if (Number.isFinite(na) && Number.isFinite(nb)) {
+          return na - nb;
+        }
+
+        return a.localeCompare(b);
+      })
+      .slice(0, keys.length - MAX_FORECASTS)
+      .forEach(key => delete forecasts[key]);
+  }
+}
+
+// ================== XỬ LÝ PHIÊN MỚI ==================
+
+function processSession(session) {
+  const exists = history.some(
+    item => sameId(item.id, session.id)
+  );
+
+  if (exists) return false;
+
+  // Chấm dự đoán đã tạo cho chính phiên này trước khi học kết quả.
+  evaluateForecast(session);
+
+  history.push(session);
+  history = history.slice(-MAX_HISTORY);
+
+  // Sau khi học kết quả, tạo dự đoán cho phiên kế tiếp.
+  const nextId = nextSessionId(session.id);
+
+  if (nextId) {
+    createForecast(nextId);
+  }
+
+  return true;
+}
+
+// ================== GỌI API NGUỒN ==================
+
+async function fetchSource() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch(SOURCE_API, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'Mozilla/5.0'
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Source API HTTP ${response.status}`);
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function syncData() {
+  if (isSyncing) return;
+
+  isSyncing = true;
+
+  try {
+    const payload = await fetchSource();
+    const sessions = extractSessions(payload);
+
+    if (!sessions.length) {
+      throw new Error(
+        'API nguồn không trả về phiên hợp lệ. Cần kiểm tra cấu trúc JSON nguồn.'
+      );
+    }
+
+    let added = 0;
+
+    for (const session of sessions) {
+      if (processSession(session)) added++;
+    }
+
+    // Luôn đảm bảo có dự đoán cho phiên kế tiếp mới nhất.
+    const latest = history[history.length - 1];
+
+    if (latest) {
+      const nextId = nextSessionId(latest.id);
+
+      if (nextId) createForecast(nextId);
+    }
+
+    saveHistory();
+    saveLearning();
+
+    lastSync = new Date().toISOString();
+    lastError = null;
+
+    console.log(
+      `[SYNC] API có ${sessions.length} phiên, thêm mới ${added}, tổng lịch sử ${history.length}`
+    );
+  } catch (err) {
+    lastError = err.name === 'AbortError'
+      ? 'API nguồn phản hồi quá chậm hoặc timeout'
+      : err.message;
+
+    console.error('[SYNC ERROR]', lastError);
+  } finally {
+    isSyncing = false;
+  }
+}
+
+// ================== API DỰ ĐOÁN ==================
+
+function getCurrentPrediction() {
+  const latest = history[history.length - 1];
+
+  if (!latest) {
+    return {
+      status: 'waiting',
+      message: 'Đang chờ dữ liệu từ API nguồn',
+      count: 0
+    };
+  }
+
+  const nextId = nextSessionId(latest.id);
+  const forecast = nextId ? forecasts[String(nextId)] : null;
+
+  const prediction = forecast || {
+    ...makePrediction(history),
+    sessionId: nextId,
+    label: makePrediction(history).prediction === 1 ? 'tai' : 'xiu'
+  };
+
+  const p = prediction.prediction;
+
+  return {
+    status: 'ok',
+    id: latest.id,
+    phienhientai: latest.id,
+    ketqua: latest.label,
+    xucxac: latest.dice,
+    tong: latest.sum,
+
+    dudoanphien: nextId,
+    dudoan: p === 1 ? 'tai' : 'xiu',
+    dotincay: `${prediction.confidence}%`,
+    xacsuattai: prediction.probabilityTai,
+
+    nenchoi: Boolean(prediction.shouldBet),
+    khuyennghi: prediction.shouldBet
+      ? 'Có chênh lệch xác suất, nhưng không đảm bảo thắng'
+      : 'Nên bỏ qua vì dữ liệu chưa đủ lợi thế',
+
+    models: prediction.models || null,
+    lichsu: history.length,
+    lastSync,
+    uptime: new Date().toISOString()
+  };
+}
+
+// ================== ROUTES ==================
+
+// Trang chủ
 app.get('/', (req, res) => {
-  try {
-    res.json(buildResponse());
-  } catch (err) {
-    console.error('[API]', err.message);
-    res.status(500).json({
-      error: 'Internal server error'
-    });
-  }
+  res.json({
+    name: 'LC79 MD5 Prediction API',
+    status: 'running',
+    endpoints: [
+      '/status',
+      '/api/status',
+      '/ping',
+      '/predict',
+      '/history',
+      '/forecast-history'
+    ]
+  });
 });
 
-app.get('/predict', (req, res) => {
-  try {
-    res.json(buildResponse());
-  } catch (err) {
-    console.error('[PREDICT]', err.message);
-    res.status(500).json({
-      error: 'Prediction error'
-    });
-  }
-});
-
+// Hai route trạng thái được khai báo trực tiếp.
 app.get('/status', (req, res) => {
-  try {
-    res.json(buildStatus());
-  } catch (err) {
-    res.status(500).json({
-      status: 'error',
-      error: err.message
-    });
-  }
+  res.status(200).json({
+    status: 'ok',
+    service: 'LC79 MD5',
+    uptime: process.uptime(),
+    startedAt,
+    lastSync,
+    lastError,
+    syncing: isSyncing,
+    historyCount: history.length,
+    forecastCount: Object.keys(forecasts).length,
+    stats,
+    accuracy: stats.evaluated
+      ? Number((stats.correct / stats.evaluated * 100).toFixed(2))
+      : null,
+    time: new Date().toISOString()
+  });
 });
 
 app.get('/api/status', (req, res) => {
-  try {
-    res.json(buildStatus());
-  } catch (err) {
-    res.status(500).json({
-      status: 'error',
-      error: err.message
-    });
-  }
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    lastSync,
+    lastError,
+    syncing: isSyncing,
+    historyCount: history.length,
+    stats,
+    time: new Date().toISOString()
+  });
 });
 
 app.get('/ping', (req, res) => {
-  res.type('text').send('pong');
+  res.status(200).send('pong');
 });
 
+// Dự đoán phiên kế tiếp
+app.get('/predict', (req, res) => {
+  res.status(200).json(getCurrentPrediction());
+});
+
+// Lịch sử kết quả
 app.get('/history', (req, res) => {
-  const history = readHistory();
+  const limit = Math.min(
+    Math.max(parseInt(req.query.limit, 10) || 20, 1),
+    500
+  );
 
   res.json({
     count: history.length,
-    last20: history.slice(-20)
+    last: history.slice(-limit).reverse()
   });
 });
 
+// Lịch sử dự đoán và kết quả kiểm chứng
 app.get('/forecast-history', (req, res) => {
+  const limit = Math.min(
+    Math.max(parseInt(req.query.limit, 10) || 50, 1),
+    300
+  );
+
+  const rows = Object.values(forecasts)
+    .sort((a, b) => {
+      const na = Number(a.sessionId);
+      const nb = Number(b.sessionId);
+
+      if (Number.isFinite(na) && Number.isFinite(nb)) {
+        return na - nb;
+      }
+
+      return a.sessionId.localeCompare(b.sessionId);
+    })
+    .slice(-limit)
+    .reverse();
+
   res.json({
-    count: learningState.forecasts.length,
-    forecasts: learningState.forecasts.slice(-100)
+    count: rows.length,
+    stats,
+    accuracy: stats.evaluated
+      ? Number((stats.correct / stats.evaluated * 100).toFixed(2))
+      : null,
+    data: rows
   });
 });
 
-// =====================================================
-// 23. MANUAL RESET
-// =====================================================
+// Đồng bộ thủ công
+app.get('/sync', async (req, res) => {
+  await syncData();
 
-app.post('/admin/reset', (req, res) => {
-  const expectedToken = process.env.RESET_TOKEN;
-  const suppliedToken = req.headers['x-reset-token'];
-
-  if (!expectedToken) {
-    return res.status(503).json({
-      error: 'Chưa cấu hình RESET_TOKEN trên Render'
-    });
-  }
-
-  if (suppliedToken !== expectedToken) {
-    return res.status(403).json({
-      error: 'Sai reset token'
-    });
-  }
-
-  try {
-    learningState = createLearningState();
-
-    writeHistory([]);
-    atomicSave(LEARNING_FILE, learningState);
-
-    lastSyncError = null;
-
-    res.json({
-      status: 'reset_ok',
-      message: 'Đã tạo lại lịch sử và mô hình',
-      time: formatTimeVN()
-    });
-
-    setTimeout(() => {
-      syncData();
-    }, 1000);
-
-  } catch (err) {
-    console.error('[RESET ERROR]', err.message);
-
-    res.status(500).json({
-      error: 'Reset failed',
-      detail: err.message
-    });
-  }
+  res.json({
+    status: lastError ? 'error' : 'ok',
+    lastSync,
+    lastError,
+    historyCount: history.length
+  });
 });
 
-// =====================================================
-// 24. BOOT
-// =====================================================
+// Reset có bảo vệ bằng token môi trường.
+app.post('/admin/reset', (req, res) => {
+  const token = process.env.RESET_TOKEN;
 
-initFiles();
-learningState = loadLearningState();
+  if (!token || req.headers['x-reset-token'] !== token) {
+    return res.status(403).json({
+      status: 'error',
+      message: 'Forbidden'
+    });
+  }
 
-// Khôi phục hàng chờ còn dang dở.
-try {
-  processPendingSessions();
-} catch (err) {
-  console.error('[PENDING RECOVERY]', err.message);
-}
+  history = [];
+  forecasts = {};
+  stats = {
+    evaluated: 0,
+    correct: 0,
+    wrong: 0
+  };
 
-app.listen(PORT, () => {
-  console.log(`[BOOT] Server running on port ${PORT}`);
-  console.log(`[BOOT] Time: ${formatTimeVN()}`);
-  console.log(`[BOOT] Models: ${ALGO_NAMES.join(', ')}`);
+  saveHistory();
+  saveLearning();
+
+  res.json({
+    status: 'ok',
+    message: 'Đã reset dữ liệu học'
+  });
+});
+
+// Route không tồn tại
+app.use((req, res) => {
+  res.status(404).json({
+    status: 'error',
+    message: 'Route not found',
+    path: req.originalUrl,
+    available: [
+      '/',
+      '/status',
+      '/api/status',
+      '/ping',
+      '/predict',
+      '/history',
+      '/forecast-history',
+      '/sync'
+    ]
+  });
+});
+
+// ================== KHỞI ĐỘNG ==================
+
+loadData();
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log('====================================');
+  console.log('[BOOT] LC79 MD5 API started');
+  console.log('[BOOT] Port:', PORT);
   console.log('[BOOT] /status enabled');
   console.log('[BOOT] /api/status enabled');
-  console.log('[BOOT] Forecast ledger enabled');
+  console.log('[BOOT] /ping enabled');
+  console.log('[BOOT] History:', history.length);
+  console.log('====================================');
 
+  // Đồng bộ ngay khi khởi động.
   syncData();
 
-  const timer = setInterval(syncData, POLL_INTERVAL);
+  // Sau đó đồng bộ định kỳ.
+  setInterval(syncData, POLL_MS);
+});
 
-  if (typeof timer.unref === 'function') {
-    timer.unref();
-  }
+server.on('error', err => {
+  console.error('[SERVER ERROR]', err);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT]', err);
+});
+
+process.on('unhandledRejection', err => {
+  console.error('[UNHANDLED REJECTION]', err);
 });
