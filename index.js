@@ -1,3 +1,4 @@
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -24,6 +25,22 @@ function initDataFile() {
   } else {
     console.log('[INIT] Existing history preserved');
   }
+}
+
+// Xoá file lịch sử rồi tạo lại file rỗng (dùng khi reset).
+function resetHistory() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      fs.unlinkSync(DATA_FILE);
+    }
+  } catch (err) {
+    console.error('[RESET ERROR]', err.message);
+  }
+
+  fs.writeFileSync(DATA_FILE, '[]', 'utf8');
+  CAUTION.data = [];
+
+  console.log('[RESET] History file deleted and recreated');
 }
 
 function readHistory() {
@@ -113,11 +130,237 @@ function normalizeSession(raw) {
 
   return {
     id: Number(id),
+    _id: String(raw._id ?? id),
     dices,
     sum,
     result
   };
 }
+
+
+// =====================================================
+// 3. ALGORITHM ENGINE (port từ bot.pylc)
+// =====================================================
+
+// 1) BAYESIAN ADAPTIVE
+class BayesianModel {
+  constructor() {
+    this.alpha = 1;
+    this.beta = 1;
+  }
+
+  update(result) {
+    if (result === 1) this.alpha += 1;
+    else this.beta += 1;
+  }
+
+  probability() {
+    return this.alpha / (this.alpha + this.beta);
+  }
+}
+
+// 2) HMM (SIMPLIFIED) - nhận diện cầu
+class HMMModel {
+  predict(seq) {
+    if (seq.length < 8) return 0;
+
+    const last = seq[seq.length - 1];
+    let score = 0.0;
+
+    // CẦU BỆT - càng dài càng mạnh
+    let streak = 1;
+    for (let i = seq.length - 2; i >= 0; i--) {
+      if (seq[i] === last) streak++;
+      else break;
+    }
+
+    if (streak >= 4) {
+      score += Math.min(1.2, streak * 0.25);
+    }
+
+    // CẦU ĐẢO ĐỀU
+    const last6 = seq.slice(-6).join('');
+    if (last6 === '101010' || last6 === '010101') {
+      score -= 1.0;
+    }
+
+    // CẦU GÃY
+    const recent = seq.slice(-7, -1);
+    if (recent.filter(v => v === last).length <= 2) {
+      score -= 0.8;
+    }
+
+    // NHIỄU CAO -> giảm tác động
+    if (new Set(seq.slice(-6)).size === 2 && streak <= 2) {
+      score *= 0.5;
+    }
+
+    if (score > 0.4) return 1;
+    if (score < -0.4) return -1;
+    return 0;
+  }
+}
+
+// 3) BANDIT - ONLINE LEARNING
+class Bandit {
+  constructor() {
+    this.score = {};
+  }
+
+  weight(name) {
+    const s = this.score[name] ?? 0;
+    return Math.max(0.3, Math.min(1.5, s));
+  }
+
+  reward(name, win) {
+    const s = (this.score[name] ?? 0) * 0.95;
+    this.score[name] = win ? s + 0.15 : s - 0.2;
+  }
+}
+
+// 4) ENTROPY DETECTOR
+function entropy(seq, w = 20) {
+  if (seq.length < w) return 0;
+
+  const win = seq.slice(-w);
+  const p1 = win.reduce((a, b) => a + b, 0) / w;
+  const p0 = 1 - p1;
+
+  if (p1 === 0 || p1 === 1) return 0;
+
+  return -(p1 * Math.log2(p1) + p0 * Math.log2(p0));
+}
+
+function chaosBlock(seq) {
+  if (seq.length < 25) return false;
+  return entropy(seq, 30) > 0.92;
+}
+
+// 5) MD5 SIGNAL
+function algoMd5(id, seqLen) {
+  const md5 = crypto
+    .createHash('md5')
+    .update(String(id))
+    .digest('hex');
+
+  let sig = parseInt(md5[md5.length - 1], 16) < 8 ? 1 : -1;
+
+  // chuỗi càng dài -> md5 càng yếu
+  if (seqLen > 40) sig *= 0.4;
+
+  return sig;
+}
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+// INIT MODELS
+const bayes = new BayesianModel();
+const hmm = new HMMModel();
+const bandit = new Bandit();
+
+// FINAL DECISION
+function calculateFinal(seq, id) {
+  const n = seq.length;
+  const caution = chaosBlock(seq);
+
+  const pBayes = bayes.probability();
+  const hmmSig = hmm.predict(seq);
+  const md5Sig = algoMd5(id, n);
+
+  const wBayes = bandit.weight('bayes');
+  const wHmm = bandit.weight('hmm');
+  const wMd5 = bandit.weight('md5');
+
+  let score;
+
+  if (n < 25) {
+    // Short-term ưu tiên pattern
+    score =
+      (pBayes - 0.5) * 4 +
+      hmmSig * 3 +
+      md5Sig * 2;
+  } else {
+    // Long-term ưu tiên thống kê
+    score =
+      (pBayes - 0.5) * 6 * wBayes +
+      hmmSig * 2 * wHmm +
+      md5Sig * 1 * wMd5;
+  }
+
+  const prob = sigmoid(score);
+  const final = prob >= 0.5 ? 'TÀI' : 'XỈU';
+
+  const strength = Math.abs(score);
+  const confidence =
+    Math.round(Math.min(95, 50 + strength * 18) * 100) / 100;
+
+  return { final, confidence, caution };
+}
+
+// =====================================================
+// 4. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION, RESET
+// =====================================================
+
+let lastPredict = null;           // { predict, caution }
+let lastId = 0;                   // phiên mới nhất đã xử lý
+const STATS = { total: 0, win: 0, lose: 0 };
+const CAUTION = { data: [] };     // 10 lần "Lưu Ý" gần nhất
+const COMPARE = [];               // log 10 phiên gần nhất
+
+// Xử lý 1 phiên mới: dự đoán phiên kế tiếp + chấm điểm dự đoán trước.
+function processLatest(session) {
+  const seq = readHistory().map(h => h.result);
+  const { final, confidence, caution } =
+    calculateFinal(seq, session._id ?? session.id);
+
+  if (lastPredict) {
+    STATS.total++;
+
+    const real = session.result === 1 ? 'TÀI' : 'XỈU';
+    const win = lastPredict.predict === real;
+
+    bandit.reward('bayes', win);
+    bandit.reward('hmm', win);
+    bandit.reward('md5', win);
+
+    if (win) STATS.win++;
+    else STATS.lose++;
+
+    COMPARE.push({
+      phien: session.id,
+      predict: lastPredict.predict,
+      real,
+      win
+    });
+    if (COMPARE.length > 10) COMPARE.shift();
+
+    // Reset ẩn theo 10 lần "Lưu Ý"
+    if (lastPredict.caution) {
+      CAUTION.data.push(win ? 1 : 0);
+      if (CAUTION.data.length > 10) CAUTION.data.shift();
+
+      if (CAUTION.data.length === 10) {
+        const winCount = CAUTION.data.reduce((a, b) => a + b, 0);
+        const loseCount = 10 - winCount;
+
+        // Reset nếu sai >= đúng: xoá + tạo lại file lịch sử
+        if (loseCount >= winCount) {
+          resetHistory();
+        }
+      }
+    }
+  }
+
+  lastPredict = { predict: final, caution };
+
+  return { final, confidence, caution };
+}
+
+// =====================================================
+// 5. SYNC
+// =====================================================
 
 let syncInProgress = false;
 
@@ -137,41 +380,42 @@ async function syncData() {
       return;
     }
 
+    const fresh = list
+      .map(normalizeSession)
+      .filter(s =>
+        Number.isFinite(s.id) &&
+        Number.isFinite(s.sum) &&
+        [0, 1].includes(s.result) &&
+        s.id > lastId
+      )
+      .sort((a, b) => a.id - b.id);
+
+    if (!fresh.length) return;
+
     const history = readHistory();
     const knownIds = new Set(history.map(h => h.id));
+    const added = [];
 
-    let added = 0;
-
-    for (const item of list) {
-      const s = normalizeSession(item);
-
-      if (
-        !Number.isFinite(s.id) ||
-        !Number.isFinite(s.sum) ||
-        ![0, 1].includes(s.result) ||
-        knownIds.has(s.id)
-      ) {
-        continue;
-      }
-
+    for (const s of fresh) {
+      if (knownIds.has(s.id)) continue;
       history.push(s);
       knownIds.add(s.id);
-      added++;
+      bayes.update(s.result);
+      added.push(s);
     }
 
-    if (added > 0) {
+    lastId = fresh[fresh.length - 1].id;
+
+    if (added.length > 0) {
       history.sort((a, b) => a.id - b.id);
-
       const saved = history.slice(-MAX_HISTORY);
-
       writeHistory(saved);
 
       console.log(
-        `[SYNC] +${added} sessions | Total ${saved.length}`
+        `[SYNC] +${added.length} sessions | Total ${saved.length}`
       );
 
-      // Học ngay từ các phiên mới
-      learnNewSessions(saved);
+      processLatest(added[added.length - 1]);
     }
 
   } catch (err) {
@@ -182,411 +426,16 @@ async function syncData() {
 }
 
 // =====================================================
-// 3. USER ALGORITHM ENGINE (UPGRADED)
-// =====================================================
-
-// 1. BAYESIAN ADAPTIVE (có quên dần để theo kịp khi game đổi)
-
-class BayesianModel {
-  constructor(decay = 0.98) {
-    this.alpha = 1;
-    this.beta = 1;
-    this.decay = decay;
-  }
-
-  update(result) {
-    this.alpha *= this.decay;
-    this.beta *= this.decay;
-
-    if (result === 1) {
-      this.alpha += 1;
-    } else {
-      this.beta += 1;
-    }
-  }
-
-  probability() {
-    return this.alpha / (this.alpha + this.beta);
-  }
-}
-
-// 2. MARKOV – TỰ HỌC CẦU TỪ DỮ LIỆU (thay luật cầu cố định)
-
-class HMMModel {
-  constructor(orders = [2, 3, 4, 5], decay = 0.995, minN = 6) {
-    this.orders = orders;
-    this.decay = decay;
-    this.minN = minN;
-    this.counts = {};
-
-    for (const k of orders) {
-      this.counts[k] = new Map();
-    }
-  }
-
-  // Trả về tín hiệu trong [-1, 1]: >0 nghiêng TÀI, <0 nghiêng XỈU
-  predict(seq) {
-    if (seq.length < 8) return 0;
-
-    let num = 0;
-    let den = 0;
-
-    for (const k of this.orders) {
-      if (seq.length < k) continue;
-
-      const cell = this.counts[k].get(seq.slice(-k).join(''));
-
-      if (!cell) continue;
-
-      const n = cell[0] + cell[1];
-
-      if (n < this.minN) continue;
-
-      const p = (cell[1] + 1) / (n + 2); // Laplace
-
-      num += (p - 0.5) * 2 * n; // ngữ cảnh nhiều mẫu → tin hơn
-      den += n;
-    }
-
-    return den > 0 ? num / den : 0;
-  }
-
-  update(seq, result) {
-    for (const k of this.orders) {
-      if (seq.length < k) continue;
-
-      const key = seq.slice(-k).join('');
-
-      let cell = this.counts[k].get(key);
-
-      if (!cell) {
-        cell = [0, 0];
-        this.counts[k].set(key, cell);
-      }
-
-      cell[0] *= this.decay; // quên dần cầu cũ
-      cell[1] *= this.decay;
-      cell[result] += 1;
-    }
-  }
-}
-
-// 3. BANDIT – ONLINE LEARNING
-
-class Bandit {
-  constructor() {
-    this.score = Object.create(null);
-  }
-
-  get(name) {
-    return this.score[name] === undefined ? 1 : this.score[name];
-  }
-
-  weight(name) {
-    return Math.max(0.3, Math.min(1.5, this.get(name)));
-  }
-
-  reward(name, win) {
-    // kéo dần về 1.0 (quên ký ức cũ)
-    let s = 1 + (this.get(name) - 1) * 0.95;
-
-    // thưởng/phạt đối xứng: đoán ngẫu nhiên thì trọng số đứng yên
-    s += win ? 0.05 : -0.05;
-
-    this.score[name] = s;
-  }
-}
-
-// 4. ENTROPY DETECTOR
-
-function entropy(seq, w = 20) {
-  if (seq.length < w) return 0;
-
-  const win = seq.slice(-w);
-
-  const p1 = win.reduce((sum, value) => sum + value, 0) / w;
-  const p0 = 1 - p1;
-
-  if (p1 === 0 || p1 === 1) {
-    return 0;
-  }
-
-  return -(p1 * Math.log2(p1) + p0 * Math.log2(p0));
-}
-
-function chaosBlock(seq) {
-  if (seq.length < 25) return false;
-
-  return entropy(seq, 30) > 0.97;
-}
-
-// 5. MD5 SIGNAL (bandit sẽ tự hạ trọng số nếu nó vô dụng)
-
-function algoMD5(id, seqLen) {
-  const hash = crypto
-    .createHash('md5')
-    .update(String(id))
-    .digest('hex');
-
-  let signal =
-    parseInt(hash[hash.length - 1], 16) < 8
-      ? 1
-      : -1;
-
-  if (seqLen > 40) {
-    signal *= 0.4;
-  }
-
-  return signal;
-}
-
-// =====================================================
-// INIT MODELS (giữ trạng thái giữa các lần dự đoán)
-// =====================================================
-
-const bayes = new BayesianModel();
-const hmm = new HMMModel();
-const bandit = new Bandit();
-
-// Theo dõi độ chính xác thật (walk-forward)
-const tracker = {
-  total: 0,
-  hits: 0,
-  recent: []
-};
-
-const TRACKER_WINDOW = 300;
-const TRACKER_MIN_SEQ = 10;
-
-let learnedUpTo = -Infinity;
-
-function sigmoid(x) {
-  const c = Math.max(-30, Math.min(30, x));
-  return 1 / (1 + Math.exp(-c));
-}
-
-// =====================================================
-// FINAL DECISION (thuần dự đoán, không thay đổi mô hình)
-// =====================================================
-
-function calculateFinal(seq, id) {
-  const n = seq.length;
-
-  const caution = chaosBlock(seq);
-
-  const pBayes = bayes.probability();
-
-  const hmmSignal = hmm.predict(seq);
-
-  const md5Signal = algoMD5(id, n);
-
-  const wBayes = bandit.weight('bayes');
-  const wHmm = bandit.weight('hmm');
-  const wMd5 = bandit.weight('md5');
-
-  let score;
-
-  if (n < 25) {
-    // Short-term ưu tiên pattern
-    score =
-      (pBayes - 0.5) * 4 * wBayes +
-      hmmSignal * 4 * wHmm +
-      md5Signal * 1 * wMd5;
-  } else {
-    // Long-term ưu tiên thống kê
-    score =
-      (pBayes - 0.5) * 6 * wBayes +
-      hmmSignal * 3 * wHmm +
-      md5Signal * 0.5 * wMd5;
-  }
-
-  const probabilityTai = sigmoid(score);
-
-  const final =
-    probabilityTai >= 0.5
-      ? 'TÀI'
-      : 'XỈU';
-
-  // confidence = xác suất mô hình tự tính
-  const confidence = Math.round(
-    Math.max(probabilityTai, 1 - probabilityTai) * 10000
-  ) / 100;
-
-  return {
-    final,
-    confidence,
-    caution,
-    score,
-    probabilityTai,
-    bayesProbability: pBayes,
-    hmmSignal,
-    md5Signal,
-    weights: {
-      bayes: wBayes,
-      hmm: wHmm,
-      md5: wMd5
-    }
-  };
-}
-
-// =====================================================
-// HỌC SAU MỖI PHIÊN (walk-forward: dự đoán trước, học sau)
-// =====================================================
-
-function learnNewSessions(history) {
-  if (!Array.isArray(history) || history.length === 0) return;
-
-  const results = history.map(h => h.result);
-
-  for (let i = 0; i < history.length; i++) {
-    const session = history[i];
-
-    if (session.id <= learnedUpTo) continue;
-
-    const actual = session.result;
-
-    if (i === 0) {
-      bayes.update(actual);
-      learnedUpTo = session.id;
-      continue;
-    }
-
-    const seqBefore = results.slice(0, i);
-    const prevId = history[i - 1].id;
-
-    // Dự đoán như lúc chưa biết kết quả
-    const r = calculateFinal(seqBefore, prevId);
-
-    if (seqBefore.length >= TRACKER_MIN_SEQ) {
-      const hit = (r.final === 'TÀI' ? 1 : 0) === actual ? 1 : 0;
-
-      tracker.total++;
-      tracker.hits += hit;
-      tracker.recent.push(hit);
-
-      if (tracker.recent.length > TRACKER_WINDOW) {
-        tracker.recent.shift();
-      }
-    }
-
-    // Thưởng / phạt từng thuật toán
-    const signals = [
-      ['bayes', r.bayesProbability - 0.5],
-      ['hmm', r.hmmSignal],
-      ['md5', r.md5Signal]
-    ];
-
-    for (const [name, sig] of signals) {
-      if (sig === 0) continue;
-
-      bandit.reward(name, (sig > 0) === (actual === 1));
-    }
-
-    // Cập nhật mô hình bằng kết quả thật
-    bayes.update(actual);
-    hmm.update(seqBefore, actual);
-
-    learnedUpTo = session.id;
-  }
-}
-
-function historicalAccuracyPercent() {
-  if (tracker.recent.length === 0) return 0;
-
-  const hits = tracker.recent.reduce((a, b) => a + b, 0);
-
-  return Math.round((hits / tracker.recent.length) * 10000) / 100;
-}
-
-// =====================================================
-// API COMPATIBILITY
-// =====================================================
-
-function ensemblePredict(seq, currentId) {
-  const result = calculateFinal(seq, currentId);
-
-  const pick = result.final === 'TÀI' ? 1 : 0;
-
-  const algorithms = [
-    {
-      name: 'bayesian_adaptive',
-
-      pick: result.bayesProbability >= 0.5 ? 1 : 0,
-
-      probabilityTai: result.bayesProbability,
-
-      weight: result.weights.bayes
-    },
-
-    {
-      name: 'hmm_simplified',
-
-      pick:
-        result.hmmSignal > 0
-          ? 1
-          : result.hmmSignal < 0
-            ? 0
-            : pick,
-
-      probabilityTai: 0.5 + result.hmmSignal * 0.5,
-
-      weight: result.weights.hmm
-    },
-
-    {
-      name: 'md5_signal',
-
-      pick: result.md5Signal > 0 ? 1 : 0,
-
-      probabilityTai:
-        result.md5Signal > 0
-          ? 0.75
-          : 0.25,
-
-      weight: result.weights.md5
-    }
-  ];
-
-  const agreement = algorithms.filter(
-    algo => algo.pick === pick
-  ).length;
-
-  return {
-    pick,
-
-    confidence: result.confidence,
-
-    pTai: result.probabilityTai,
-
-    agreement: `${agreement}/${algorithms.length}`,
-
-    historicalAccuracy: historicalAccuracyPercent(),
-
-    trainedSamples: seq.length,
-
-    caution: result.caution,
-
-    algorithms
-  };
-}
-
-// =====================================================
-// 20. VIETNAM TIME
+// 6. VIETNAM TIME
 // =====================================================
 
 function formatTimeVN() {
-  const now = new Date(
-    Date.now() + 7 * 3600 * 1000
-  );
-
-  return now.toISOString().replace(
-    'Z',
-    '+07:00'
-  );
+  const now = new Date(Date.now() + 7 * 3600 * 1000);
+  return now.toISOString().replace('Z', '+07:00');
 }
 
 // =====================================================
-// 21. API RESPONSE
+// 7. API RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -600,66 +449,23 @@ function buildResponse() {
     };
   }
 
-  // Đảm bảo mô hình đã học hết lịch sử hiện có (idempotent)
-  learnNewSessions(history);
-
   const current = history[history.length - 1];
+  const seq = history.map(h => h.result);
 
-  const seq = history.map(
-    h => h.result
-  );
-
-  const ens = ensemblePredict(
-    seq,
-    String(current.id)
-  );
+  const { final, confidence, caution } =
+    calculateFinal(seq, current._id ?? current.id);
 
   return {
     id: 'noname09',
-
     phienhientai: current.id,
-
-    ketqua: current.result === 1
-      ? 'tai'
-      : 'xiu',
-
+    ketqua: current.result === 1 ? 'tai' : 'xiu',
     xucxac: current.dices,
-
     tong: current.sum,
-
     dudoanphien: current.id + 1,
-
-    dudoan: ens.pick === 1
-      ? 'tai'
-      : 'xiu',
-
-    dotincay: `${ens.confidence}%`,
-
-    xacsuattai:
-      `${(ens.pTai * 100).toFixed(2)}%`,
-
-    xacsuatxiu:
-      `${((1 - ens.pTai) * 100).toFixed(2)}%`,
-
-    dochinhxaclichsu:
-      `${ens.historicalAccuracy}%`,
-
-    solanhoctap: ens.trainedSamples,
-
-    dongthuan: ens.agreement,
-
-    trongso: ens.algorithms.map(a => ({
-      thuattoan: a.name,
-
-      du_doan: a.pick === 1
-        ? 'tai'
-        : 'xiu',
-
-      xac_suat_tai: a.probabilityTai,
-
-      trong_so: a.weight
-    })),
-
+    dudoan: final === 'TÀI' ? 'tai' : 'xiu',
+    dotincay: `${confidence}%`,
+    luuy: caution,
+    thongke: { ...STATS },
     uptime: formatTimeVN()
   };
 }
@@ -704,7 +510,6 @@ app.get('/history', (req, res) => {
       count: h.length,
       last20: h.slice(-20)
     });
-
   } catch (err) {
     res.status(500).json({
       error: 'History error'
@@ -718,16 +523,17 @@ app.get('/history', (req, res) => {
 
 initDataFile();
 
-// Học từ lịch sử đã lưu để mô hình sẵn sàng ngay khi khởi động.
-
-learnNewSessions(readHistory());
+// Khôi phục trạng thái từ lịch sử đang có.
+{
+  const h = readHistory();
+  h.forEach(s => bayes.update(s.result));
+  lastId = h.length ? h[h.length - 1].id : 0;
+}
 
 // Đồng bộ lần đầu.
-
 syncData();
 
 // Đồng bộ định kỳ.
-
 const syncTimer = setInterval(
   syncData,
   POLL_INTERVAL
@@ -742,11 +548,6 @@ app.listen(PORT, () => {
     `[BOOT] Port ${PORT} — ${formatTimeVN()}`
   );
 
-  console.log(
-    '[BOOT] Bayesian + Markov + Bandit + Entropy + MD5 engine loaded'
-  );
-
-  console.log(
-    '[BOOT] Upgraded algorithm engine enabled'
-  );
+  console.log('[BOOT] Bayes + HMM + Bandit + MD5 engine loaded');
 });
+
