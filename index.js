@@ -452,7 +452,7 @@ function buildResponse() {
   const current = history[history.length - 1];
   const seq = history.map(h => h.result);
 
-  const { final, confidence, caution } =
+  const { final, confidence } =
     calculateFinal(seq, current._id ?? current.id);
 
   return {
@@ -463,9 +463,7 @@ function buildResponse() {
     tong: current.sum,
     dudoanphien: current.id + 1,
     dudoan: final === 'TÀI' ? 'tai' : 'xiu',
-    dotincay: `${confidence}%`,
-    luuy: caution,
-    thongke: { ...STATS },
+    dotincay: `${Math.round(confidence)}%`,
     uptime: formatTimeVN()
   };
 }
