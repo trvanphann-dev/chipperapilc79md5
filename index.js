@@ -2,30 +2,22 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 
-// =====================================================
-// 0. CONFIGURATION
-// =====================================================
-
+// Cho phép trang HTML ở domain khác gọi API này (CORS).
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
-
-const SOURCE_API =
-  'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
+const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
 const POLL_INTERVAL = 15000;
 const MAX_HISTORY = 500;
@@ -44,21 +36,26 @@ function initDataFile() {
   }
 }
 
+// Xoá file lịch sử rồi tạo lại file rỗng (dùng khi reset).
 function resetHistory() {
   try {
-    fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-    CAUTION.data = [];
-    console.log('[RESET] History cleared');
+    if (fs.existsSync(DATA_FILE)) {
+      fs.unlinkSync(DATA_FILE);
+    }
   } catch (err) {
     console.error('[RESET ERROR]', err.message);
   }
+
+  fs.writeFileSync(DATA_FILE, '[]', 'utf8');
+  CAUTION.data = [];
+
+  console.log('[RESET] History file deleted and recreated');
 }
 
 function readHistory() {
   try {
     const data = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(data || '[]');
-
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
     console.error('[READ ERROR]', err.message);
@@ -111,18 +108,14 @@ function normalizeSession(raw) {
     ? rawDices.map(Number)
     : [];
 
-  const validDices = dices.filter(
-    d => Number.isInteger(d) && d >= 1 && d <= 6
-  );
-
-  const sum = validDices.length
-    ? validDices.reduce((a, b) => a + b, 0)
+  const sum = dices.length
+    ? dices.reduce((a, b) => a + b, 0)
     : Number(raw.sum ?? 0);
 
   const sourceResult = String(
     raw.resultTruyenThong ??
     raw.bigSmall ??
-    (Array.isArray(raw.result) ? '' : raw.result) ??
+    raw.result ??
     ''
   ).trim().toUpperCase();
 
@@ -147,411 +140,202 @@ function normalizeSession(raw) {
   return {
     id: Number(id),
     _id: String(raw._id ?? id),
-    dices: validDices,
+    dices,
     sum,
     result
   };
 }
 
-// =====================================================
-// 3. BASIC STATISTICS
-// =====================================================
-
-function clampProbability(value) {
-  if (!Number.isFinite(value)) return 0.5;
-
-  return Math.max(0.02, Math.min(0.98, value));
-}
-
-function countTai(seq) {
-  return seq.reduce(
-    (total, value) => total + (value === 1 ? 1 : 0),
-    0
-  );
-}
-
-function smoothedProbability(seq, windowSize, prior = 12) {
-  const data = seq.slice(-windowSize);
-
-  if (!data.length) return 0.5;
-
-  const tai = countTai(data);
-
-  return (tai + prior * 0.5) / (data.length + prior);
-}
 
 // =====================================================
-// 4. EXPERT MODEL 1 - GLOBAL
+// 3. ALGORITHM ENGINE (port từ bot.pylc)
 // =====================================================
 
-function globalModel(seq) {
-  if (!seq.length) return 0.5;
-
-  return smoothedProbability(seq, seq.length, 12);
-}
-
-// =====================================================
-// 5. EXPERT MODEL 2 - RECENT TREND
-// =====================================================
-
-function recentModel(seq) {
-  const p10 = smoothedProbability(seq, 10, 8);
-  const p25 = smoothedProbability(seq, 25, 10);
-  const p50 = smoothedProbability(seq, 50, 12);
-  const p100 = smoothedProbability(seq, 100, 16);
-
-  return (
-    p10 * 0.40 +
-    p25 * 0.30 +
-    p50 * 0.20 +
-    p100 * 0.10
-  );
-}
-
-// =====================================================
-// 6. EXPERT MODEL 3 - MARKOV
-// =====================================================
-
-function markovModel(seq) {
-  if (seq.length < 3) return 0.5;
-
-  const last = seq[seq.length - 1];
-
-  let total = 0;
-  let tai = 0;
-
-  for (let i = 0; i < seq.length - 1; i++) {
-    if (seq[i] === last) {
-      total++;
-
-      if (seq[i + 1] === 1) {
-        tai++;
-      }
-    }
+// 1) BAYESIAN ADAPTIVE
+class BayesianModel {
+  constructor() {
+    this.alpha = 1;
+    this.beta = 1;
   }
 
-  if (total === 0) return 0.5;
+  update(result) {
+    if (result === 1) this.alpha += 1;
+    else this.beta += 1;
+  }
 
-  const observed = (tai + 3) / (total + 6);
-  const reliability = total / (total + 12);
-
-  return 0.5 + (observed - 0.5) * reliability;
+  probability() {
+    return this.alpha / (this.alpha + this.beta);
+  }
 }
 
-// =====================================================
-// 7. EXPERT MODEL 4 - PATTERN
-// =====================================================
+// 2) HMM (SIMPLIFIED) - nhận diện cầu
+class HMMModel {
+  predict(seq) {
+    if (seq.length < 8) return 0;
 
-function patternModel(seq) {
-  if (seq.length < 5) return 0.5;
+    const last = seq[seq.length - 1];
+    let score = 0.0;
 
-  let weighted = 0;
-  let totalWeight = 0;
-
-  for (let length = 1; length <= 3; length++) {
-    if (seq.length <= length) continue;
-
-    const context = seq.slice(-length).join('');
-
-    let matches = 0;
-    let tai = 0;
-
-    for (let i = 0; i <= seq.length - length - 1; i++) {
-      const oldContext = seq
-        .slice(i, i + length)
-        .join('');
-
-      if (oldContext === context) {
-        matches++;
-
-        if (seq[i + length] === 1) {
-          tai++;
-        }
-      }
+    // CẦU BỆT - càng dài càng mạnh
+    let streak = 1;
+    for (let i = seq.length - 2; i >= 0; i--) {
+      if (seq[i] === last) streak++;
+      else break;
     }
 
-    // Bỏ qua mẫu có quá ít dữ liệu.
-    if (matches < 3) continue;
-
-    const observed = (tai + 3) / (matches + 6);
-    const reliability = matches / (matches + 10);
-
-    const probability =
-      0.5 + (observed - 0.5) * reliability;
-
-    const weight = Math.min(matches, 12);
-
-    weighted += probability * weight;
-    totalWeight += weight;
-  }
-
-  if (totalWeight === 0) return 0.5;
-
-  return weighted / totalWeight;
-}
-
-// =====================================================
-// 8. COLLECT EXPERT PREDICTIONS
-// =====================================================
-
-function getExpertProbabilities(seq) {
-  return [
-    clampProbability(globalModel(seq)),
-    clampProbability(recentModel(seq)),
-    clampProbability(markovModel(seq)),
-    clampProbability(patternModel(seq))
-  ];
-}
-
-// =====================================================
-// 9. ADAPTIVE WEIGHT SYSTEM
-// =====================================================
-
-function normalizeWeights(weights) {
-  const adjusted = weights.map(w =>
-    Math.max(0.02, Number.isFinite(w) ? w : 0.25)
-  );
-
-  const total = adjusted.reduce((a, b) => a + b, 0);
-
-  return adjusted.map(w => w / total);
-}
-
-function weightedPrediction(probabilities, weights) {
-  return probabilities.reduce(
-    (sum, p, i) => sum + p * weights[i],
-    0
-  );
-}
-
-// Cập nhật trọng số sau khi có kết quả thật.
-// Dùng log-loss để phạt dự đoán sai tự tin quá mức.
-function updateExpertWeights(weights, probabilities, actual) {
-  const learningRate = 0.15;
-
-  const updated = weights.map((weight, i) => {
-    const p = clampProbability(probabilities[i]);
-
-    const loss = actual === 1
-      ? -Math.log(p)
-      : -Math.log(1 - p);
-
-    return weight * Math.exp(-learningRate * loss);
-  });
-
-  return normalizeWeights(updated);
-}
-
-// =====================================================
-// 10. WALK-FORWARD ADAPTIVE LEARNING
-// =====================================================
-
-function adaptiveEvaluation(seq) {
-  const minimumTraining = 25;
-
-  let weights = [0.25, 0.25, 0.25, 0.25];
-
-  const results = [];
-
-  if (seq.length <= minimumTraining) {
-    return {
-      weights,
-      results,
-      probability: 0.5,
-      confidence: 50,
-      components: {}
-    };
-  }
-
-  // Chỉ dùng dữ liệu trước phiên đang kiểm tra.
-  for (let i = minimumTraining; i < seq.length; i++) {
-    const training = seq.slice(0, i);
-
-    const expertProbabilities =
-      getExpertProbabilities(training);
-
-    const prediction = weightedPrediction(
-      expertProbabilities,
-      weights
-    );
-
-    const actual = seq[i];
-
-    const predictedSide = prediction >= 0.5 ? 1 : 0;
-
-    results.push({
-      predicted: predictedSide,
-      actual,
-      probability: prediction,
-      correct: predictedSide === actual
-    });
-
-    // Biết kết quả rồi mới cập nhật trọng số.
-    weights = updateExpertWeights(
-      weights,
-      expertProbabilities,
-      actual
-    );
-  }
-
-  // Trọng số đã được học từ dữ liệu lịch sử.
-  const currentExperts = getExpertProbabilities(seq);
-
-  const finalProbability = weightedPrediction(
-    currentExperts,
-    weights
-  );
-
-  // Đánh giá độ chính xác trên tối đa 80 phiên gần nhất.
-  const evaluationResults = results.slice(-80);
-
-  const correct = evaluationResults.filter(
-    r => r.correct
-  ).length;
-
-  // Prior cân bằng, tránh kết luận quá mạnh khi ít mẫu.
-  const priorSamples = 20;
-  const priorCorrect = 10;
-
-  const accuracy =
-    (correct + priorCorrect) /
-    (evaluationResults.length + priorSamples);
-
-  const confidence = Math.round(accuracy * 100);
-
-  return {
-    weights,
-    results: evaluationResults,
-    probability: clampProbability(finalProbability),
-    confidence,
-    components: {
-      global: currentExperts[0],
-      recent: currentExperts[1],
-      markov: currentExperts[2],
-      pattern: currentExperts[3],
-      weights: {
-        global: weights[0],
-        recent: weights[1],
-        markov: weights[2],
-        pattern: weights[3]
-      }
+    if (streak >= 4) {
+      score += Math.min(1.2, streak * 0.25);
     }
-  };
+
+    // CẦU ĐẢO ĐỀU
+    const last6 = seq.slice(-6).join('');
+    if (last6 === '101010' || last6 === '010101') {
+      score -= 1.0;
+    }
+
+    // CẦU GÃY
+    const recent = seq.slice(-7, -1);
+    if (recent.filter(v => v === last).length <= 2) {
+      score -= 0.8;
+    }
+
+    // NHIỄU CAO -> giảm tác động
+    if (new Set(seq.slice(-6)).size === 2 && streak <= 2) {
+      score *= 0.5;
+    }
+
+    if (score > 0.4) return 1;
+    if (score < -0.4) return -1;
+    return 0;
+  }
 }
 
-// =====================================================
-// 11. PREDICTION ENGINE
-// =====================================================
-
-function predictProbability(seq) {
-  if (!seq || seq.length < 25) {
-    return {
-      probability: 0.5,
-      confidence: 50,
-      components: {}
-    };
+// 3) BANDIT - ONLINE LEARNING
+class Bandit {
+  constructor() {
+    this.score = {};
   }
 
-  const evaluation = adaptiveEvaluation(seq);
+  weight(name) {
+    const s = this.score[name] ?? 0;
+    return Math.max(0.3, Math.min(1.5, s));
+  }
 
-  return {
-    probability: evaluation.probability,
-    confidence: evaluation.confidence,
-    components: evaluation.components
-  };
+  reward(name, win) {
+    const s = (this.score[name] ?? 0) * 0.95;
+    this.score[name] = win ? s + 0.15 : s - 0.2;
+  }
 }
 
-// =====================================================
-// 12. ENTROPY / CAUTION
-// =====================================================
+// 4) ENTROPY DETECTOR
+function entropy(seq, w = 20) {
+  if (seq.length < w) return 0;
 
-function entropy(seq, windowSize = 30) {
-  const data = seq.slice(-windowSize);
-
-  if (data.length < windowSize) return 0;
-
-  const tai = countTai(data);
-  const p1 = tai / data.length;
+  const win = seq.slice(-w);
+  const p1 = win.reduce((a, b) => a + b, 0) / w;
   const p0 = 1 - p1;
 
   if (p1 === 0 || p1 === 1) return 0;
 
-  return -(
-    p1 * Math.log2(p1) +
-    p0 * Math.log2(p0)
-  );
+  return -(p1 * Math.log2(p1) + p0 * Math.log2(p0));
 }
 
 function chaosBlock(seq) {
-  if (seq.length < 30) return false;
-
+  if (seq.length < 25) return false;
   return entropy(seq, 30) > 0.92;
 }
 
-// =====================================================
-// 13. FINAL PREDICTION
-// =====================================================
+// 5) MD5 SIGNAL
+function algoMd5(id, seqLen) {
+  const md5 = crypto
+    .createHash('md5')
+    .update(String(id))
+    .digest('hex');
 
-function calculateFinal(seq) {
-  const result = predictProbability(seq);
+  let sig = parseInt(md5[md5.length - 1], 16) < 8 ? 1 : -1;
 
-  const probability = result.probability;
+  // chuỗi càng dài -> md5 càng yếu
+  if (seqLen > 40) sig *= 0.4;
 
-  const final = probability >= 0.5
-    ? 'TÀI'
-    : 'XỈU';
+  return sig;
+}
 
-  return {
-    final,
-    confidence: result.confidence,
-    caution: chaosBlock(seq),
-    probability,
-    components: result.components
-  };
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+// INIT MODELS
+const bayes = new BayesianModel();
+const hmm = new HMMModel();
+const bandit = new Bandit();
+
+// FINAL DECISION
+function calculateFinal(seq, id) {
+  const n = seq.length;
+  const caution = chaosBlock(seq);
+
+  const pBayes = bayes.probability();
+  const hmmSig = hmm.predict(seq);
+  const md5Sig = algoMd5(id, n);
+
+  const wBayes = bandit.weight('bayes');
+  const wHmm = bandit.weight('hmm');
+  const wMd5 = bandit.weight('md5');
+
+  let score;
+
+  if (n < 25) {
+    // Short-term ưu tiên pattern
+    score =
+      (pBayes - 0.5) * 4 +
+      hmmSig * 3 +
+      md5Sig * 2;
+  } else {
+    // Long-term ưu tiên thống kê
+    score =
+      (pBayes - 0.5) * 6 * wBayes +
+      hmmSig * 2 * wHmm +
+      md5Sig * 1 * wMd5;
+  }
+
+  const prob = sigmoid(score);
+  const final = prob >= 0.5 ? 'TÀI' : 'XỈU';
+
+  const strength = Math.abs(score);
+  const confidence =
+    Math.round(Math.min(95, 50 + strength * 18) * 100) / 100;
+
+  return { final, confidence, caution };
 }
 
 // =====================================================
-// 14. STATE: PREDICTION AND STATISTICS
+// 4. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION, RESET
 // =====================================================
 
-let lastPredict = null;
-let lastId = 0;
+let lastPredict = null;           // { predict, caution }
+let lastId = 0;                   // phiên mới nhất đã xử lý
+const STATS = { total: 0, win: 0, lose: 0 };
+const CAUTION = { data: [] };     // 10 lần "Lưu Ý" gần nhất
+const COMPARE = [];               // log 10 phiên gần nhất
 
-const STATS = {
-  total: 0,
-  win: 0,
-  lose: 0
-};
-
-const CAUTION = {
-  data: []
-};
-
-const COMPARE = [];
-
+// Xử lý 1 phiên mới: dự đoán phiên kế tiếp + chấm điểm dự đoán trước.
 function processLatest(session) {
   const seq = readHistory().map(h => h.result);
-
-  const {
-    final,
-    confidence,
-    caution
-  } = calculateFinal(seq);
+  const { final, confidence, caution } =
+    calculateFinal(seq, session._id ?? session.id);
 
   if (lastPredict) {
     STATS.total++;
 
-    const real = session.result === 1
-      ? 'TÀI'
-      : 'XỈU';
-
+    const real = session.result === 1 ? 'TÀI' : 'XỈU';
     const win = lastPredict.predict === real;
 
-    if (win) {
-      STATS.win++;
-    } else {
-      STATS.lose++;
-    }
+    bandit.reward('bayes', win);
+    bandit.reward('hmm', win);
+    bandit.reward('md5', win);
+
+    if (win) STATS.win++;
+    else STATS.lose++;
 
     COMPARE.push({
       phien: session.id,
@@ -559,34 +343,32 @@ function processLatest(session) {
       real,
       win
     });
+    if (COMPARE.length > 10) COMPARE.shift();
 
-    if (COMPARE.length > 10) {
-      COMPARE.shift();
-    }
-
+    // Reset ẩn theo 10 lần "Lưu Ý"
     if (lastPredict.caution) {
       CAUTION.data.push(win ? 1 : 0);
+      if (CAUTION.data.length > 10) CAUTION.data.shift();
 
-      if (CAUTION.data.length > 10) {
-        CAUTION.data.shift();
+      if (CAUTION.data.length === 10) {
+        const winCount = CAUTION.data.reduce((a, b) => a + b, 0);
+        const loseCount = 10 - winCount;
+
+        // Reset nếu sai >= đúng: xoá + tạo lại file lịch sử
+        if (loseCount >= winCount) {
+          resetHistory();
+        }
       }
     }
   }
 
-  lastPredict = {
-    predict: final,
-    caution
-  };
+  lastPredict = { predict: final, caution };
 
-  return {
-    final,
-    confidence,
-    caution
-  };
+  return { final, confidence, caution };
 }
 
 // =====================================================
-// 15. SYNC
+// 5. SYNC
 // =====================================================
 
 let syncInProgress = false;
@@ -620,31 +402,22 @@ async function syncData() {
     if (!fresh.length) return;
 
     const history = readHistory();
-
-    const knownIds = new Set(
-      history.map(h => h.id)
-    );
-
+    const knownIds = new Set(history.map(h => h.id));
     const added = [];
 
-    for (const session of fresh) {
-      if (knownIds.has(session.id)) continue;
-
-      history.push(session);
-      knownIds.add(session.id);
-      added.push(session);
+    for (const s of fresh) {
+      if (knownIds.has(s.id)) continue;
+      history.push(s);
+      knownIds.add(s.id);
+      bayes.update(s.result);
+      added.push(s);
     }
 
-    lastId = Math.max(
-      lastId,
-      ...fresh.map(s => s.id)
-    );
+    lastId = fresh[fresh.length - 1].id;
 
     if (added.length > 0) {
       history.sort((a, b) => a.id - b.id);
-
       const saved = history.slice(-MAX_HISTORY);
-
       writeHistory(saved);
 
       console.log(
@@ -662,19 +435,16 @@ async function syncData() {
 }
 
 // =====================================================
-// 16. VIETNAM TIME
+// 6. VIETNAM TIME
 // =====================================================
 
 function formatTimeVN() {
-  const now = new Date(
-    Date.now() + 7 * 3600 * 1000
-  );
-
+  const now = new Date(Date.now() + 7 * 3600 * 1000);
   return now.toISOString().replace('Z', '+07:00');
 }
 
 // =====================================================
-// 17. API RESPONSE
+// 7. API RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -689,41 +459,26 @@ function buildResponse() {
   }
 
   const current = history[history.length - 1];
-
   const seq = history.map(h => h.result);
 
-  const {
-    final,
-    confidence
-  } = calculateFinal(seq);
+  const { final, confidence } =
+    calculateFinal(seq, current._id ?? current.id);
 
   return {
     id: 'noname09',
-
     phienhientai: current.id,
-
-    ketqua: current.result === 1
-      ? 'tai'
-      : 'xiu',
-
+    ketqua: current.result === 1 ? 'tai' : 'xiu',
     xucxac: current.dices,
-
     tong: current.sum,
-
     dudoanphien: current.id + 1,
-
-    dudoan: final === 'TÀI'
-      ? 'tai'
-      : 'xiu',
-
-    dotincay: `${confidence}%`,
-
+    dudoan: final === 'TÀI' ? 'tai' : 'xiu',
+    dotincay: `${Math.round(confidence)}%`,
     uptime: formatTimeVN()
   };
 }
 
 // =====================================================
-// 18. API ROUTES
+// 22. API ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
@@ -756,11 +511,11 @@ app.get('/ping', (req, res) => {
 
 app.get('/history', (req, res) => {
   try {
-    const history = readHistory();
+    const h = readHistory();
 
     res.json({
-      count: history.length,
-      last20: history.slice(-20)
+      count: h.length,
+      last20: h.slice(-20)
     });
   } catch (err) {
     res.status(500).json({
@@ -770,74 +525,19 @@ app.get('/history', (req, res) => {
 });
 
 // =====================================================
-// 19. DEBUG ROUTE
-// Xem xác suất và trọng số từng mô hình.
-// =====================================================
-
-app.get('/debug', (req, res) => {
-  try {
-    const history = readHistory();
-    const seq = history.map(h => h.result);
-
-    const result = adaptiveEvaluation(seq);
-
-    res.json({
-      totalSessions: seq.length,
-
-      taiCount: countTai(seq),
-
-      xiuCount: seq.length - countTai(seq),
-
-      taiRate: seq.length
-        ? Number((countTai(seq) / seq.length).toFixed(4))
-        : 0,
-
-      prediction: result.probability >= 0.5
-        ? 'tai'
-        : 'xiu',
-
-      taiProbability: Number(
-        (result.probability * 100).toFixed(2)
-      ),
-
-      xiuProbability: Number(
-        ((1 - result.probability) * 100).toFixed(2)
-      ),
-
-      confidence: result.confidence,
-
-      components: result.components,
-
-      backtestSamples: result.results.length,
-
-      backtestCorrect: result.results.filter(
-        r => r.correct
-      ).length
-    });
-  } catch (err) {
-    console.error('[DEBUG ERROR]', err.message);
-
-    res.status(500).json({
-      error: 'Debug error'
-    });
-  }
-});
-
-// =====================================================
-// 20. BOOT SERVER
+// 23. BOOT SERVER
 // =====================================================
 
 initDataFile();
 
+// Khôi phục trạng thái từ lịch sử đang có.
 {
-  const history = readHistory();
-
-  lastId = history.length
-    ? Number(history[history.length - 1].id)
-    : 0;
+  const h = readHistory();
+  h.forEach(s => bayes.update(s.result));
+  lastId = h.length ? h[h.length - 1].id : 0;
 }
 
-// Đồng bộ ngay khi khởi động.
+// Đồng bộ lần đầu.
 syncData();
 
 // Đồng bộ định kỳ.
@@ -855,11 +555,6 @@ app.listen(PORT, () => {
     `[BOOT] Port ${PORT} — ${formatTimeVN()}`
   );
 
-  console.log(
-    '[BOOT] Adaptive Global + Recent + Markov + Pattern loaded'
-  );
-
-  console.log(
-    '[BOOT] Walk-forward learning enabled'
-  );
+  console.log('[BOOT] Bayes + HMM + Bandit + MD5 engine loaded');
 });
+
