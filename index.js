@@ -2,7 +2,6 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -12,12 +11,18 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
   next();
 });
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
-const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
+
+const SOURCE_API =
+  'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
 const POLL_INTERVAL = 15000;
 const MAX_HISTORY = 500;
@@ -36,7 +41,6 @@ function initDataFile() {
   }
 }
 
-// Xoá file lịch sử rồi tạo lại file rỗng (dùng khi reset).
 function resetHistory() {
   try {
     if (fs.existsSync(DATA_FILE)) {
@@ -56,6 +60,7 @@ function readHistory() {
   try {
     const data = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(data || '[]');
+
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
     console.error('[READ ERROR]', err.message);
@@ -146,227 +151,286 @@ function normalizeSession(raw) {
   };
 }
 
-
 // =====================================================
-// 3. ALGORITHM ENGINE - ENSEMBLE + WALK-FORWARD CALIBRATION
+// 3. ALGORITHM ENGINE - DATA BASED, NO FIXED SIDE
 // =====================================================
 
-// Giới hạn xác suất.
+// Giới hạn xác suất để tránh giá trị bất thường.
 function clampProbability(value) {
   return Math.max(0.01, Math.min(0.99, value));
 }
 
-// 1. BAYESIAN ADAPTIVE
-// Dữ liệu gần hiện tại có trọng số cao hơn.
-function bayesianProbability(seq, windowSize = 120) {
+// Tính tỷ lệ Tài có làm mượt.
+// Prior luôn cân bằng 50/50, không thiên vị bên nào.
+function smoothedProbability(seq, windowSize, priorWeight = 8) {
   const data = seq.slice(-windowSize);
-  let alpha = 1;
-  let beta = 1;
 
-  for (let i = 0; i < data.length; i++) {
-    const age = data.length - 1 - i;
-    const weight = Math.pow(0.985, age);
-
-    if (data[i] === 1) {
-      alpha += weight;
-    } else {
-      beta += weight;
-    }
+  if (data.length === 0) {
+    return 0.5;
   }
 
-  return clampProbability(
-    alpha / (alpha + beta)
+  const taiCount = data.reduce(
+    (total, value) => total + (value === 1 ? 1 : 0),
+    0
+  );
+
+  return (
+    (taiCount + priorWeight * 0.5) /
+    (data.length + priorWeight)
   );
 }
 
-// 2. MARKOV MODEL
-// Học xác suất chuyển trạng thái.
+// -----------------------------------------------------
+// 3.1 BAYESIAN PROBABILITY
+// -----------------------------------------------------
+
+function bayesianProbability(seq) {
+  if (!seq.length) return 0.5;
+
+  const taiCount = seq.filter(v => v === 1).length;
+  const xiuCount = seq.length - taiCount;
+
+  // Prior Beta(1, 1): hai phía hoàn toàn cân bằng.
+  return (taiCount + 1) / (seq.length + 2);
+}
+
+// -----------------------------------------------------
+// 3.2 RECENT DATA PROBABILITY
+// -----------------------------------------------------
+
+function recentProbability(seq) {
+  const p12 = smoothedProbability(seq, 12, 8);
+  const p30 = smoothedProbability(seq, 30, 8);
+  const p80 = smoothedProbability(seq, 80, 12);
+
+  // Dữ liệu gần đây có trọng số lớn hơn,
+  // nhưng vẫn giữ thông tin từ lịch sử dài hơn.
+  return (
+    p12 * 0.50 +
+    p30 * 0.30 +
+    p80 * 0.20
+  );
+}
+
+// -----------------------------------------------------
+// 3.3 MARKOV TRANSITION PROBABILITY
+// -----------------------------------------------------
+
 function markovProbability(seq) {
-  if (seq.length < 2) {
-    return bayesianProbability(seq);
-  }
+  if (seq.length < 2) return 0.5;
 
   const last = seq[seq.length - 1];
 
-  let tai = 1;
-  let xiu = 1;
-  let samples = 0;
+  let total = 0;
+  let taiCount = 0;
 
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i - 1] !== last) continue;
+  // Chỉ xét các lần chuyển đổi có trạng thái trước
+  // giống trạng thái gần nhất hiện tại.
+  for (let i = 0; i < seq.length - 1; i++) {
+    if (seq[i] === last) {
+      total++;
 
-    const age = seq.length - 1 - i;
-    const weight = Math.pow(0.99, age);
-
-    if (seq[i] === 1) {
-      tai += weight;
-    } else {
-      xiu += weight;
+      if (seq[i + 1] === 1) {
+        taiCount++;
+      }
     }
-
-    samples++;
   }
 
-  const markov = tai / (tai + xiu);
-  const base = bayesianProbability(seq);
-
-  const reliability = Math.min(
-    0.75,
-    samples / 16
-  );
-
-  return clampProbability(
-    base * (1 - reliability) +
-    markov * reliability
-  );
+  // Làm mượt cân bằng để tránh mẫu quá nhỏ.
+  return (taiCount + 2) / (total + 4);
 }
 
-// 3. PATTERN RECOGNITION
-// Nhận diện chuỗi tương đồng trong lịch sử.
+// -----------------------------------------------------
+// 3.4 PATTERN PROBABILITY
+// -----------------------------------------------------
+
 function patternProbability(seq) {
-  const base = bayesianProbability(seq);
+  if (seq.length < 3) return 0.5;
 
-  const maxPatternLength = Math.min(
-    5,
-    seq.length - 1
-  );
+  let weightedProbability = 0;
+  let totalWeight = 0;
 
-  if (maxPatternLength < 2) {
-    return base;
-  }
+  // Kiểm tra các mẫu có độ dài 1 đến 4.
+  for (let contextLength = 1; contextLength <= 4; contextLength++) {
+    if (seq.length <= contextLength) continue;
 
-  let totalTai = 0;
-  let totalXiu = 0;
-  let totalMatches = 0;
+    const context = seq
+      .slice(-contextLength)
+      .join('');
 
-  for (let length = 2; length <= maxPatternLength; length++) {
-    const pattern = seq.slice(-length).join('');
+    let matches = 0;
+    let taiAfterMatch = 0;
 
-    let tai = 0;
-    let xiu = 0;
+    for (
+      let i = 0;
+      i <= seq.length - contextLength - 1;
+      i++
+    ) {
+      const oldContext = seq
+        .slice(i, i + contextLength)
+        .join('');
 
-    for (let i = 0; i + length < seq.length; i++) {
-      if (
-        seq.slice(i, i + length).join('') !== pattern
-      ) {
-        continue;
-      }
+      if (oldContext === context) {
+        matches++;
 
-      const next = seq[i + length];
-
-      const age = seq.length - 1 - (i + length);
-      const weight = Math.pow(0.99, age);
-
-      if (next === 1) {
-        tai += weight;
-      } else {
-        xiu += weight;
+        if (seq[i + contextLength] === 1) {
+          taiAfterMatch++;
+        }
       }
     }
 
-    const matches = tai + xiu;
+    if (matches === 0) continue;
 
-    if (matches > 0) {
-      const patternWeight = Math.min(
-        1,
-        matches / 5
-      );
+    // Prior cân bằng, giảm ảnh hưởng mẫu ít xuất hiện.
+    const probability =
+      (taiAfterMatch + 2) / (matches + 4);
 
-      totalTai += tai * patternWeight;
-      totalXiu += xiu * patternWeight;
-      totalMatches += matches * patternWeight;
-    }
+    // Mẫu dài hơn được ưu tiên nhẹ,
+    // nhưng không được áp đảo mẫu ngắn.
+    const weight = Math.min(matches, 10) *
+      (1 + contextLength * 0.15);
+
+    weightedProbability += probability * weight;
+    totalWeight += weight;
   }
 
-  if (totalMatches < 1) {
-    return base;
-  }
+  if (totalWeight === 0) return 0.5;
 
-  const learned =
-    (totalTai + 1) /
-    (totalTai + totalXiu + 2);
-
-  const reliability = Math.min(
-    0.65,
-    totalMatches / 12
-  );
-
-  return clampProbability(
-    base * (1 - reliability) +
-    learned * reliability
-  );
+  return weightedProbability / totalWeight;
 }
 
-// 4. RECENT STATISTICS
-// Thống kê 20 phiên gần nhất.
-function recentProbability(seq, windowSize = 20) {
-  const data = seq.slice(-windowSize);
+// -----------------------------------------------------
+// 3.5 ENSEMBLE MODEL
+// -----------------------------------------------------
 
-  if (!data.length) {
-    return 0.5;
-  }
-
-  const tai = data.reduce(
-    (sum, value) => sum + value,
-    0
-  );
-
-  return clampProbability(
-    (tai + 1) / (data.length + 2)
-  );
-}
-
-// 5. ENSEMBLE MODEL
-// Kết hợp nhiều mô hình dự đoán.
 function predictProbability(seq) {
   if (!seq.length) {
-    return 0.5;
+    return {
+      probability: 0.5,
+      components: {}
+    };
   }
 
   const pBayes = bayesianProbability(seq);
+  const pRecent = recentProbability(seq);
   const pMarkov = markovProbability(seq);
   const pPattern = patternProbability(seq);
-  const pRecent = recentProbability(seq, 20);
 
-  const sampleFactor = Math.min(
-    1,
-    seq.length / 40
-  );
+  // Kết hợp các mô hình theo trọng số cố định,
+  // áp dụng đối xứng cho Tài và Xỉu.
+  const modelProbability =
+    pBayes * 0.15 +
+    pRecent * 0.35 +
+    pMarkov * 0.25 +
+    pPattern * 0.25;
 
-  const weights = {
-    bayes: 0.35,
-    markov: 0.30 * sampleFactor,
-    pattern: 0.20 * sampleFactor,
-    recent: 0.15
+  // Phương án B:
+  // kết hợp xác suất mô hình với dữ liệu gần đây.
+  // Không cộng điểm cố định cho Tài hoặc Xỉu.
+  const finalProbability =
+    modelProbability * 0.70 +
+    pRecent * 0.30;
+
+  return {
+    probability: clampProbability(finalProbability),
+
+    components: {
+      bayesian: pBayes,
+      recent: pRecent,
+      markov: pMarkov,
+      pattern: pPattern,
+      ensemble: modelProbability
+    }
   };
-
-  const totalWeight = Object.values(weights)
-    .reduce((sum, value) => sum + value, 0);
-
-  const probability = (
-    pBayes * weights.bayes +
-    pMarkov * weights.markov +
-    pPattern * weights.pattern +
-    pRecent * weights.recent
-  ) / totalWeight;
-
-  return clampProbability(probability);
 }
 
-// 6. ENTROPY DETECTOR
-// Phát hiện chuỗi có độ nhiễu cao.
-function entropy(seq, windowSize = 20) {
-  if (seq.length < windowSize) {
+// =====================================================
+// 4. WALK-FORWARD BACKTEST
+// =====================================================
+
+// Mỗi dự đoán lịch sử chỉ được sử dụng dữ liệu xuất hiện
+// trước phiên cần dự đoán.
+// Không được dùng kết quả tương lai để dự đoán quá khứ.
+
+function buildWalkForwardResults(seq, maxSamples = 100) {
+  const results = [];
+
+  // Cần tối thiểu 20 phiên trước khi bắt đầu kiểm tra.
+  const minimumTraining = 20;
+
+  if (seq.length <= minimumTraining) {
+    return results;
+  }
+
+  const startIndex = Math.max(
+    minimumTraining,
+    seq.length - maxSamples
+  );
+
+  for (let i = startIndex; i < seq.length; i++) {
+    const trainingData = seq.slice(0, i);
+    const actual = seq[i];
+
+    const prediction = predictProbability(trainingData);
+
+    const predictedSide =
+      prediction.probability >= 0.5 ? 1 : 0;
+
+    results.push({
+      predicted: predictedSide,
+      actual,
+      correct: predictedSide === actual
+    });
+  }
+
+  return results;
+}
+
+// =====================================================
+// 5. CONFIDENCE CALIBRATION
+// =====================================================
+
+// Độ tin cậy được tính từ kết quả kiểm tra lịch sử.
+// Không lấy độ lệch xác suất làm độ chính xác.
+// Có prior 50/50 để hạn chế dao động khi số mẫu ít.
+
+function calculateConfidence(seq) {
+  const results = buildWalkForwardResults(seq, 100);
+
+  if (results.length === 0) {
+    return 50;
+  }
+
+  const correctCount = results.filter(
+    item => item.correct
+  ).length;
+
+  // Prior tương đương 12 mẫu, trong đó 6 mẫu đúng.
+  const priorSamples = 12;
+  const priorCorrect = 6;
+
+  const accuracy =
+    (correctCount + priorCorrect) /
+    (results.length + priorSamples);
+
+  return Math.round(
+    Math.max(0, Math.min(100, accuracy * 100))
+  );
+}
+
+// =====================================================
+// 6. ENTROPY / CAUTION
+// =====================================================
+
+function entropy(seq, windowSize = 30) {
+  const data = seq.slice(-windowSize);
+
+  if (data.length < windowSize) {
     return 0;
   }
 
-  const data = seq.slice(-windowSize);
-
-  const p1 = data.reduce(
-    (sum, value) => sum + value,
-    0
-  ) / data.length;
-
+  const taiCount = data.filter(v => v === 1).length;
+  const p1 = taiCount / data.length;
   const p0 = 1 - p1;
 
   if (p1 === 0 || p1 === 1) {
@@ -380,132 +444,41 @@ function entropy(seq, windowSize = 20) {
 }
 
 function chaosBlock(seq) {
-  return (
-    seq.length >= 30 &&
-    entropy(seq, 30) > 0.92
-  );
+  if (seq.length < 30) {
+    return false;
+  }
+
+  // Entropy cao thể hiện chuỗi cân bằng và khó phân biệt.
+  return entropy(seq, 30) > 0.92;
 }
 
-// 7. WALK-FORWARD VALIDATION
-// Kiểm định từng dự đoán bằng dữ liệu có trước thời điểm đó.
-function buildWalkForwardResults(seq) {
-  const results = [];
-  const minimumTraining = 25;
+// =====================================================
+// 7. FINAL PREDICTION
+// =====================================================
 
-  for (
-    let i = minimumTraining;
-    i < seq.length;
-    i++
-  ) {
-    const training = seq.slice(0, i);
-    const actual = seq[i];
+function calculateFinal(seq) {
+  const result = predictProbability(seq);
 
-    const probability = predictProbability(training);
-
-    const predicted = probability >= 0.5 ? 1 : 0;
-
-    results.push({
-      probability,
-      strength: Math.max(
-        probability,
-        1 - probability
-      ),
-      correct: predicted === actual
-    });
-  }
-
-  return results;
-}
-
-// 8. CONFIDENCE CALIBRATION
-// Tính độ tin cậy dựa trên tỷ lệ dự đoán đúng trong lịch sử.
-function calculateConfidence(seq, currentProbability) {
-  const historyResults = buildWalkForwardResults(seq);
-
-  if (!historyResults.length) {
-    return 50;
-  }
-
-  const currentStrength = Math.max(
-    currentProbability,
-    1 - currentProbability
-  );
-
-  let comparable = historyResults.filter(item =>
-    Math.abs(
-      item.strength - currentStrength
-    ) <= 0.05
-  );
-
-  // Mở rộng phạm vi nếu số mẫu quá ít.
-  if (comparable.length < 8) {
-    comparable = historyResults.filter(item =>
-      Math.abs(
-        item.strength - currentStrength
-      ) <= 0.10
-    );
-  }
-
-  // Không đủ mẫu thì dùng toàn bộ lịch sử kiểm định.
-  if (comparable.length < 5) {
-    comparable = historyResults;
-  }
-
-  const wins = comparable.reduce(
-    (sum, item) =>
-      sum + (item.correct ? 1 : 0),
-    0
-  );
-
-  const sampleCount = comparable.length;
-  const observedAccuracy = wins / sampleCount;
-
-  // Prior 50% để hạn chế dao động khi ít dữ liệu.
-  const priorSamples = 12;
-
-  const calibrated = (
-    observedAccuracy * sampleCount +
-    0.5 * priorSamples
-  ) / (sampleCount + priorSamples);
-
-  return Math.round(
-    Math.max(
-      1,
-      Math.min(99, calibrated * 100)
-    ) * 100
-  ) / 100;
-}
-
-// 9. FINAL DECISION
-function calculateFinal(seq, id) {
-  const probability = predictProbability(seq);
+  const probability = result.probability;
 
   const final = probability >= 0.5
     ? 'TÀI'
     : 'XỈU';
 
-  const confidence = calculateConfidence(
-    seq,
-    probability
-  );
-
-  const caution =
-    chaosBlock(seq) ||
-    confidence < 55;
+  const confidence = calculateConfidence(seq);
+  const caution = chaosBlock(seq);
 
   return {
     final,
     confidence,
     caution,
-    probability: Math.round(
-      probability * 10000
-    ) / 10000
+    probability,
+    components: result.components
   };
 }
 
-
 // =====================================================
-// 4. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION, RESET
+// 8. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION
 // =====================================================
 
 let lastPredict = null;
@@ -523,7 +496,7 @@ const CAUTION = {
 
 const COMPARE = [];
 
-// Xử lý 1 phiên mới.
+// Xử lý phiên mới và chấm điểm dự đoán phiên trước.
 function processLatest(session) {
   const seq = readHistory().map(h => h.result);
 
@@ -531,10 +504,7 @@ function processLatest(session) {
     final,
     confidence,
     caution
-  } = calculateFinal(
-    seq,
-    session._id ?? session.id
-  );
+  } = calculateFinal(seq);
 
   if (lastPredict) {
     STATS.total++;
@@ -562,25 +532,11 @@ function processLatest(session) {
       COMPARE.shift();
     }
 
-    // Reset ẩn theo 10 lần Lưu Ý.
     if (lastPredict.caution) {
       CAUTION.data.push(win ? 1 : 0);
 
       if (CAUTION.data.length > 10) {
         CAUTION.data.shift();
-      }
-
-      if (CAUTION.data.length === 10) {
-        const winCount = CAUTION.data.reduce(
-          (a, b) => a + b,
-          0
-        );
-
-        const loseCount = 10 - winCount;
-
-        if (loseCount >= winCount) {
-          resetHistory();
-        }
       }
     }
   }
@@ -597,17 +553,14 @@ function processLatest(session) {
   };
 }
 
-
 // =====================================================
-// 5. SYNC
+// 9. SYNC
 // =====================================================
 
 let syncInProgress = false;
 
 async function syncData() {
-  if (syncInProgress) {
-    return;
-  }
+  if (syncInProgress) return;
 
   syncInProgress = true;
 
@@ -632,9 +585,7 @@ async function syncData() {
       )
       .sort((a, b) => a.id - b.id);
 
-    if (!fresh.length) {
-      return;
-    }
+    if (!fresh.length) return;
 
     const history = readHistory();
 
@@ -645,9 +596,7 @@ async function syncData() {
     const added = [];
 
     for (const s of fresh) {
-      if (knownIds.has(s.id)) {
-        continue;
-      }
+      if (knownIds.has(s.id)) continue;
 
       history.push(s);
       knownIds.add(s.id);
@@ -672,15 +621,13 @@ async function syncData() {
 
   } catch (err) {
     console.error('[SYNC ERROR]', err.message);
-
   } finally {
     syncInProgress = false;
   }
 }
 
-
 // =====================================================
-// 6. VIETNAM TIME
+// 10. VIETNAM TIME
 // =====================================================
 
 function formatTimeVN() {
@@ -688,15 +635,11 @@ function formatTimeVN() {
     Date.now() + 7 * 3600 * 1000
   );
 
-  return now.toISOString().replace(
-    'Z',
-    '+07:00'
-  );
+  return now.toISOString().replace('Z', '+07:00');
 }
 
-
 // =====================================================
-// 7. API RESPONSE
+// 11. API RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -717,19 +660,19 @@ function buildResponse() {
   const {
     final,
     confidence
-  } = calculateFinal(
-    seq,
-    current._id ?? current.id
-  );
+  } = calculateFinal(seq);
 
   return {
     id: 'noname09',
+
     phienhientai: current.id,
+
     ketqua: current.result === 1
       ? 'tai'
       : 'xiu',
 
     xucxac: current.dices,
+
     tong: current.sum,
 
     dudoanphien: current.id + 1,
@@ -738,21 +681,19 @@ function buildResponse() {
       ? 'tai'
       : 'xiu',
 
-    dotincay: `${Math.round(confidence)}%`,
+    dotincay: `${confidence}%`,
 
     uptime: formatTimeVN()
   };
 }
 
-
 // =====================================================
-// 22. API ROUTES
+// 12. API ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
   try {
     res.json(buildResponse());
-
   } catch (err) {
     console.error('[API ERROR]', err.message);
 
@@ -765,7 +706,6 @@ app.get('/', (req, res) => {
 app.get('/predict', (req, res) => {
   try {
     res.json(buildResponse());
-
   } catch (err) {
     console.error('[PREDICT ERROR]', err.message);
 
@@ -787,7 +727,6 @@ app.get('/history', (req, res) => {
       count: h.length,
       last20: h.slice(-20)
     });
-
   } catch (err) {
     res.status(500).json({
       error: 'History error'
@@ -795,19 +734,18 @@ app.get('/history', (req, res) => {
   }
 });
 
-
 // =====================================================
-// 23. BOOT SERVER
+// 13. BOOT SERVER
 // =====================================================
 
 initDataFile();
 
-// Khôi phục trạng thái từ lịch sử đang có.
+// Khôi phục ID phiên mới nhất từ lịch sử.
 {
-  const h = readHistory();
+  const history = readHistory();
 
-  lastId = h.length
-    ? h[h.length - 1].id
+  lastId = history.length
+    ? Number(history[history.length - 1].id)
     : 0;
 }
 
@@ -830,6 +768,6 @@ app.listen(PORT, () => {
   );
 
   console.log(
-    '[BOOT] Ensemble + Walk-Forward Calibration engine loaded'
+    '[BOOT] Bayesian + Recent + Markov + Pattern + Walk-forward loaded'
   );
 });
