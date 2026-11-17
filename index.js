@@ -7,6 +7,15 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
+// Cho phép trang HTML ở domain khác gọi API này (CORS).
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
 const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
@@ -139,95 +148,37 @@ function normalizeSession(raw) {
 
 
 // =====================================================
-// 3. ALGORITHM ENGINE (port từ bot.pylc)
+// 3. ENGINE v2: ĐẶC TRƯNG + HỌC TRỰC TUYẾN (logistic) + BAYES CÓ TRỌNG SỐ THỜI GIAN
 // =====================================================
 
-// 1) BAYESIAN ADAPTIVE
-class BayesianModel {
-  constructor() {
-    this.alpha = 1;
-    this.beta = 1;
-  }
+const STATE_FILE = path.join(__dirname, 'state.json');
 
-  update(result) {
-    if (result === 1) this.alpha += 1;
-    else this.beta += 1;
-  }
+const DECAY = 0.97;      // phiên cũ giảm dần ảnh hưởng trong Bayes
+const LR = 0.05;         // tốc độ học
+const L2 = 0.002;        // kéo trọng số về 0 nếu đặc trưng không có ích
+const W_CLIP = 2.5;
+const FEATURES = ['bias', 'bayes', 'streak', 'alt', 'md5', 'short', 'long'];
+const W_INIT = { bias: 0, bayes: 0.5, streak: 0.3, alt: 0.3, md5: 0.2, short: 0, long: 0 };
 
-  probability() {
-    return this.alpha / (this.alpha + this.beta);
-  }
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
 }
 
-// 2) HMM (SIMPLIFIED) - nhận diện cầu
-class HMMModel {
-  predict(seq) {
-    if (seq.length < 8) return 0;
-
-    const last = seq[seq.length - 1];
-    let score = 0.0;
-
-    // CẦU BỆT - càng dài càng mạnh
-    let streak = 1;
-    for (let i = seq.length - 2; i >= 0; i--) {
-      if (seq[i] === last) streak++;
-      else break;
-    }
-
-    if (streak >= 4) {
-      score += Math.min(1.2, streak * 0.25);
-    }
-
-    // CẦU ĐẢO ĐỀU
-    const last6 = seq.slice(-6).join('');
-    if (last6 === '101010' || last6 === '010101') {
-      score -= 1.0;
-    }
-
-    // CẦU GÃY
-    const recent = seq.slice(-7, -1);
-    if (recent.filter(v => v === last).length <= 2) {
-      score -= 0.8;
-    }
-
-    // NHIỄU CAO -> giảm tác động
-    if (new Set(seq.slice(-6)).size === 2 && streak <= 2) {
-      score *= 0.5;
-    }
-
-    if (score > 0.4) return 1;
-    if (score < -0.4) return -1;
-    return 0;
-  }
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
-// 3) BANDIT - ONLINE LEARNING
-class Bandit {
-  constructor() {
-    this.score = {};
-  }
-
-  weight(name) {
-    const s = this.score[name] ?? 0;
-    return Math.max(0.3, Math.min(1.5, s));
-  }
-
-  reward(name, win) {
-    const s = (this.score[name] ?? 0) * 0.95;
-    this.score[name] = win ? s + 0.15 : s - 0.2;
-  }
+function mean(arr) {
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0.5;
 }
 
-// 4) ENTROPY DETECTOR
+// Entropy cửa sổ gần nhất -> phát hiện chuỗi quá nhiễu
 function entropy(seq, w = 20) {
   if (seq.length < w) return 0;
-
   const win = seq.slice(-w);
-  const p1 = win.reduce((a, b) => a + b, 0) / w;
+  const p1 = mean(win);
   const p0 = 1 - p1;
-
   if (p1 === 0 || p1 === 1) return 0;
-
   return -(p1 * Math.log2(p1) + p0 * Math.log2(p0));
 }
 
@@ -236,105 +187,164 @@ function chaosBlock(seq) {
   return entropy(seq, 30) > 0.92;
 }
 
-// 5) MD5 SIGNAL
-function algoMd5(id, seqLen) {
-  const md5 = crypto
-    .createHash('md5')
-    .update(String(id))
-    .digest('hex');
-
-  let sig = parseInt(md5[md5.length - 1], 16) < 8 ? 1 : -1;
-
-  // chuỗi càng dài -> md5 càng yếu
-  if (seqLen > 40) sig *= 0.4;
-
-  return sig;
+function md5Signal(id) {
+  const h = crypto.createHash('md5').update(String(id)).digest('hex');
+  return parseInt(h[h.length - 1], 16) < 8 ? 1 : -1;
 }
 
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
-}
-
-// INIT MODELS
-const bayes = new BayesianModel();
-const hmm = new HMMModel();
-const bandit = new Bandit();
-
-// FINAL DECISION
-function calculateFinal(seq, id) {
-  const n = seq.length;
-  const caution = chaosBlock(seq);
-
-  const pBayes = bayes.probability();
-  const hmmSig = hmm.predict(seq);
-  const md5Sig = algoMd5(id, n);
-
-  const wBayes = bandit.weight('bayes');
-  const wHmm = bandit.weight('hmm');
-  const wMd5 = bandit.weight('md5');
-
-  let score;
-
-  if (n < 25) {
-    // Short-term ưu tiên pattern
-    score =
-      (pBayes - 0.5) * 4 +
-      hmmSig * 3 +
-      md5Sig * 2;
-  } else {
-    // Long-term ưu tiên thống kê
-    score =
-      (pBayes - 0.5) * 6 * wBayes +
-      hmmSig * 2 * wHmm +
-      md5Sig * 1 * wMd5;
+class Engine {
+  constructor() {
+    this.a = 1;                 // Bayes alpha (Tài)
+    this.b = 1;                 // Bayes beta (Xỉu)
+    this.w = { ...W_INIT };     // trọng số logistic, tự học
   }
 
-  const prob = sigmoid(score);
-  const final = prob >= 0.5 ? 'TÀI' : 'XỈU';
+  // Gọi khi có kết quả mới
+  observe(result) {
+    this.a = 1 + (this.a - 1) * DECAY + (result === 1 ? 1 : 0);
+    this.b = 1 + (this.b - 1) * DECAY + (result === 0 ? 1 : 0);
+  }
 
-  const strength = Math.abs(score);
-  const confidence =
-    Math.round(Math.min(95, 50 + strength * 18) * 100) / 100;
+  features(seq, id) {
+    const n = seq.length;
+    const last = n ? seq[n - 1] : 1;
+    const dir = last === 1 ? 1 : -1;
 
-  return { final, confidence, caution };
+    let streak = 0;
+    if (n) {
+      streak = 1;
+      for (let i = n - 2; i >= 0 && seq[i] === last; i--) streak++;
+    }
+
+    let alternating = 0;
+    if (n >= 6) {
+      const t = seq.slice(-6);
+      if (t.every((v, i) => i === 0 || v !== t[i - 1])) alternating = 1;
+    }
+
+    return {
+      bias: 1,
+      bayes: (this.a / (this.a + this.b) - 0.5) * 2,
+      streak: streak >= 3 ? dir * Math.min(streak, 6) / 6 : 0,
+      alt: alternating ? -dir : 0,
+      md5: md5Signal(id),
+      short: n >= 10 ? (mean(seq.slice(-10)) - 0.5) * 2 : 0,
+      long: n >= 50 ? (mean(seq.slice(-50)) - 0.5) * 2 : 0
+    };
+  }
+
+  dot(x) {
+    return FEATURES.reduce((z, k) => z + this.w[k] * x[k], 0);
+  }
+
+  predict(seq, id) {
+    const x = this.features(seq, id);
+    return { x, p: sigmoid(this.dot(x)) };
+  }
+
+  // Học từ kết quả thật của phiên đã dự đoán
+  learn(x, result) {
+    const err = result - sigmoid(this.dot(x));
+    for (const k of FEATURES) {
+      this.w[k] = clamp(
+        this.w[k] + LR * err * x[k] - L2 * this.w[k],
+        -W_CLIP,
+        W_CLIP
+      );
+    }
+  }
+}
+
+let engine = new Engine();
+
+function decide(seq, id) {
+  const { x, p } = engine.predict(seq, id);
+  return {
+    x,
+    p,
+    final: p >= 0.5 ? 'TÀI' : 'XỈU',
+    // Độ tin cậy = xác suất mô hình tự tính (không bơm số)
+    confidence: Math.round(Math.max(p, 1 - p) * 100),
+    caution: chaosBlock(seq)
+  };
 }
 
 // =====================================================
-// 4. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION, RESET
+// 4. STATE: DỰ ĐOÁN, THỐNG KÊ, CAUTION, LƯU TRẠNG THÁI
 // =====================================================
 
-let lastPredict = null;           // { predict, caution }
-let lastId = 0;                   // phiên mới nhất đã xử lý
+let lastPredict = null;           // { forId, predict, caution, x }
+let lastId = 0;
 const STATS = { total: 0, win: 0, lose: 0 };
 const CAUTION = { data: [] };     // 10 lần "Lưu Ý" gần nhất
-const COMPARE = [];               // log 10 phiên gần nhất
+let predLog = [];                 // nhật ký dự đoán đã chấm (tối đa 2000)
 
-// Xử lý 1 phiên mới: dự đoán phiên kế tiếp + chấm điểm dự đoán trước.
+function hourVN() {
+  return new Date(Date.now() + 7 * 3600 * 1000).getUTCHours();
+}
+
+function saveState() {
+  const tmp = STATE_FILE + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({
+      engine: { a: engine.a, b: engine.b, w: engine.w },
+      lastId,
+      stats: STATS,
+      caution: CAUTION.data,
+      lastPredict,
+      predLog
+    }), 'utf8');
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (err) {
+    console.error('[STATE SAVE ERROR]', err.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return false;
+    const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+
+    engine.a = st.engine.a;
+    engine.b = st.engine.b;
+    engine.w = { ...W_INIT, ...st.engine.w };
+    lastId = st.lastId || 0;
+    Object.assign(STATS, st.stats || {});
+    CAUTION.data = Array.isArray(st.caution) ? st.caution : [];
+    lastPredict = st.lastPredict || null;
+    predLog = Array.isArray(st.predLog) ? st.predLog : [];
+
+    console.log('[INIT] Engine state restored');
+    return true;
+  } catch (err) {
+    console.error('[STATE LOAD ERROR]', err.message);
+    return false;
+  }
+}
+
+// Xử lý 1 phiên mới: chấm dự đoán trước, học, rồi dự đoán phiên kế tiếp.
 function processLatest(session) {
   const seq = readHistory().map(h => h.result);
-  const { final, confidence, caution } =
-    calculateFinal(seq, session._id ?? session.id);
 
-  if (lastPredict) {
-    STATS.total++;
-
+  if (lastPredict && lastPredict.forId === session.id) {
     const real = session.result === 1 ? 'TÀI' : 'XỈU';
     const win = lastPredict.predict === real;
 
-    bandit.reward('bayes', win);
-    bandit.reward('hmm', win);
-    bandit.reward('md5', win);
+    engine.learn(lastPredict.x, session.result);
 
+    STATS.total++;
     if (win) STATS.win++;
     else STATS.lose++;
 
-    COMPARE.push({
+    predLog.push({
       phien: session.id,
       predict: lastPredict.predict,
       real,
-      win
+      win,
+      hour: hourVN(),
+      ts: Date.now()
     });
-    if (COMPARE.length > 10) COMPARE.shift();
+    if (predLog.length > 2000) predLog.shift();
 
     // Reset ẩn theo 10 lần "Lưu Ý"
     if (lastPredict.caution) {
@@ -343,19 +353,23 @@ function processLatest(session) {
 
       if (CAUTION.data.length === 10) {
         const winCount = CAUTION.data.reduce((a, b) => a + b, 0);
-        const loseCount = 10 - winCount;
-
-        // Reset nếu sai >= đúng: xoá + tạo lại file lịch sử
-        if (loseCount >= winCount) {
-          resetHistory();
+        if (10 - winCount >= winCount) {
+          resetHistory();   // xoá + tạo lại file lịch sử
         }
       }
     }
   }
 
-  lastPredict = { predict: final, caution };
+  const d = decide(seq, session._id ?? session.id);
+  lastPredict = {
+    forId: session.id + 1,
+    predict: d.final,
+    caution: d.caution,
+    x: d.x
+  };
 
-  return { final, confidence, caution };
+  saveState();
+  return d;
 }
 
 // =====================================================
@@ -400,7 +414,7 @@ async function syncData() {
       if (knownIds.has(s.id)) continue;
       history.push(s);
       knownIds.add(s.id);
-      bayes.update(s.result);
+      engine.observe(s.result);
       added.push(s);
     }
 
@@ -451,9 +465,7 @@ function buildResponse() {
 
   const current = history[history.length - 1];
   const seq = history.map(h => h.result);
-
-  const { final, confidence } =
-    calculateFinal(seq, current._id ?? current.id);
+  const { final, confidence } = decide(seq, current._id ?? current.id);
 
   return {
     id: 'noname09',
@@ -463,8 +475,76 @@ function buildResponse() {
     tong: current.sum,
     dudoanphien: current.id + 1,
     dudoan: final === 'TÀI' ? 'tai' : 'xiu',
-    dotincay: `${Math.round(confidence)}%`,
+    dotincay: `${confidence}%`,
     uptime: formatTimeVN()
+  };
+}
+
+// =====================================================
+// 8. THỐNG KÊ & BACKTEST (để kiểm chứng độ chính xác thật)
+// =====================================================
+
+function rate(win, total) {
+  return total ? Math.round((win / total) * 1000) / 10 : null;
+}
+
+function buildStats() {
+  const byHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, total: 0, win: 0 }));
+  for (const e of predLog) {
+    byHour[e.hour].total++;
+    if (e.win) byHour[e.hour].win++;
+  }
+
+  const last50 = predLog.slice(-50);
+
+  return {
+    overall: { ...STATS, rate: rate(STATS.win, STATS.total) },
+    last50: {
+      total: last50.length,
+      win: last50.filter(e => e.win).length,
+      rate: rate(last50.filter(e => e.win).length, last50.length)
+    },
+    byHour: byHour.map(h => ({ ...h, rate: rate(h.win, h.total) })),
+    weights: engine.w,
+    note: 'Tỷ lệ theo giờ chỉ có ý nghĩa khi mỗi giờ có vài trăm phiên trở lên.'
+  };
+}
+
+// Walk-forward: mỗi phiên chỉ dùng dữ liệu TRƯỚC nó để dự đoán.
+function backtest(minTrain = 30) {
+  const hist = readHistory();
+  const e = new Engine();
+  const seq = [];
+  let total = 0;
+  let win = 0;
+
+  for (let i = 0; i < hist.length; i++) {
+    if (i >= 1) {
+      const { x, p } = e.predict(seq, hist[i - 1]._id ?? hist[i - 1].id);
+      const ok = (p >= 0.5 ? 1 : 0) === hist[i].result;
+      if (i >= minTrain) {
+        total++;
+        if (ok) win++;
+      }
+      e.learn(x, hist[i].result);
+    }
+    seq.push(hist[i].result);
+    e.observe(hist[i].result);
+  }
+
+  const pr = total ? win / total : 0;
+  const se = total ? Math.sqrt((pr * (1 - pr)) / total) : 0;
+
+  return {
+    sessions: hist.length,
+    tested: total,
+    win,
+    rate: rate(win, total),
+    ci95: total
+      ? [Math.round((pr - 1.96 * se) * 1000) / 10, Math.round((pr + 1.96 * se) * 1000) / 10]
+      : null,
+    baseline: 50,
+    note: 'Nếu khoảng ci95 chứa 50 thì chưa có bằng chứng thuật toán tốt hơn đoán ngẫu nhiên.'
   };
 }
 
@@ -496,6 +576,22 @@ app.get('/predict', (req, res) => {
   }
 });
 
+app.get('/stats', (req, res) => {
+  try {
+    res.json(buildStats());
+  } catch (err) {
+    res.status(500).json({ error: 'Stats error' });
+  }
+});
+
+app.get('/backtest', (req, res) => {
+  try {
+    res.json(backtest());
+  } catch (err) {
+    res.status(500).json({ error: 'Backtest error' });
+  }
+});
+
 app.get('/ping', (req, res) => {
   res.send('pong');
 });
@@ -521,10 +617,10 @@ app.get('/history', (req, res) => {
 
 initDataFile();
 
-// Khôi phục trạng thái từ lịch sử đang có.
-{
+// Khôi phục trạng thái đã lưu; nếu chưa có thì dựng lại từ lịch sử.
+if (!loadState()) {
   const h = readHistory();
-  h.forEach(s => bayes.update(s.result));
+  h.forEach(s => engine.observe(s.result));
   lastId = h.length ? h[h.length - 1].id : 0;
 }
 
@@ -546,6 +642,5 @@ app.listen(PORT, () => {
     `[BOOT] Port ${PORT} — ${formatTimeVN()}`
   );
 
-  console.log('[BOOT] Bayes + HMM + Bandit + MD5 engine loaded');
+  console.log('[BOOT] Engine v2: online logistic + decayed Bayes + MD5 + entropy guard');
 });
-
