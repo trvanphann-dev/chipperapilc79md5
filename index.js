@@ -15,10 +15,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
@@ -34,17 +31,27 @@ const AI_FILE = path.join(DATA_DIR, 'ai_learning_state.json');
 const SOURCE_API =
   'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
 
-const POLL_INTERVAL = 15000;
-const MAX_HISTORY = 500;
 const PORT = process.env.PORT || 3000;
+const POLL_INTERVAL = 15000;
+
+const ANALYSIS_WINDOW = 200;
+const LEARNING_WINDOW = 40;
+
+const MODEL_NAMES = [
+  'alternation',
+  'markov',
+  'pattern',
+  'regime',
+  'trend'
+];
 
 // =====================================================
 // 2. STORAGE
 // =====================================================
 
-function atomicWrite(file, data) {
+function atomicWrite(file, content) {
   const temp = file + '.tmp';
-  fs.writeFileSync(temp, data, 'utf8');
+  fs.writeFileSync(temp, content, 'utf8');
   fs.renameSync(temp, file);
 }
 
@@ -55,11 +62,11 @@ function readHistory() {
       return [];
     }
 
-    const parsed = JSON.parse(
-      fs.readFileSync(DATA_FILE, 'utf8') || '[]'
+    const data = JSON.parse(
+      fs.readFileSync(DATA_FILE, 'utf8')
     );
 
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(data) ? data : [];
   } catch (err) {
     console.error('[HISTORY READ]', err.message);
     return [];
@@ -69,27 +76,28 @@ function readHistory() {
 function writeHistory(history) {
   atomicWrite(
     DATA_FILE,
-    JSON.stringify(history.slice(-MAX_HISTORY), null, 2)
+    JSON.stringify(history.slice(-ANALYSIS_WINDOW), null, 2)
   );
 }
 
-function defaultAIState() {
+function defaultState() {
+  const weights = {};
+  const modelStats = {};
+
+  for (const name of MODEL_NAMES) {
+    weights[name] = 1;
+    modelStats[name] = {
+      total: 0,
+      correct: 0,
+      brier: 0,
+      recentLosses: []
+    };
+  }
+
   return {
-    version: 'AI-ADAPTIVE-V3',
-    weights: {
-      recent: 1,
-      markov: 1,
-      pattern: 1,
-      trend: 1,
-      streak: 1
-    },
-    modelStats: {
-      recent: { total: 0, correct: 0, brier: 0 },
-      markov: { total: 0, correct: 0, brier: 0 },
-      pattern: { total: 0, correct: 0, brier: 0 },
-      trend: { total: 0, correct: 0, brier: 0 },
-      streak: { total: 0, correct: 0, brier: 0 }
-    },
+    version: 'AI-ADAPTIVE-V4',
+    weights,
+    modelStats,
     stats: {
       total: 0,
       win: 0,
@@ -101,21 +109,20 @@ function defaultAIState() {
   };
 }
 
-function loadAIState() {
-  const defaults = defaultAIState();
+function loadState() {
+  const defaults = defaultState();
 
   try {
-    if (!fs.existsSync(AI_FILE)) {
-      return defaults;
-    }
+    if (!fs.existsSync(AI_FILE)) return defaults;
 
     const saved = JSON.parse(
       fs.readFileSync(AI_FILE, 'utf8')
     );
 
-    return {
+    const state = {
       ...defaults,
       ...saved,
+      version: 'AI-ADAPTIVE-V4',
       weights: {
         ...defaults.weights,
         ...(saved.weights || {})
@@ -133,20 +140,565 @@ function loadAIState() {
         : [],
       pending: saved.pending || null
     };
+
+    // Bảo đảm trạng thái cũ tương thích.
+    for (const name of MODEL_NAMES) {
+      const old = state.modelStats[name] || {};
+
+      state.modelStats[name] = {
+        total: Number(old.total) || 0,
+        correct: Number(old.correct) || 0,
+        brier: Number(old.brier) || 0,
+        recentLosses: Array.isArray(old.recentLosses)
+          ? old.recentLosses.slice(-LEARNING_WINDOW)
+          : []
+      };
+
+      state.weights[name] = clamp(
+        Number(state.weights[name]) || 1,
+        0.2,
+        4
+      );
+    }
+
+    return state;
   } catch (err) {
-    console.error('[AI STATE READ]', err.message);
+    console.error('[AI READ]', err.message);
     return defaults;
   }
 }
 
-let AI = loadAIState();
+let AI = loadState();
 
-function saveAIState() {
+function saveState() {
   atomicWrite(AI_FILE, JSON.stringify(AI, null, 2));
 }
 
 // =====================================================
-// 3. SOURCE API
+// 3. COMMON FUNCTIONS
+// =====================================================
+
+function clamp(x, min, max) {
+  return Math.max(min, Math.min(max, x));
+}
+
+function mean(arr) {
+  if (!arr.length) return 0.5;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function entropy(p) {
+  p = clamp(p, 0.000001, 0.999999);
+  return -p * Math.log2(p) - (1 - p) * Math.log2(1 - p);
+}
+
+function toSequence(history) {
+  return history
+    .slice(-ANALYSIS_WINDOW)
+    .map(x => Number(x.result))
+    .filter(x => x === 0 || x === 1);
+}
+
+// =====================================================
+// 4. MODEL 1: ALTERNATION INTELLIGENCE
+// Phân tích cầu 1-1: TXT / XTX
+// =====================================================
+
+function getAlternationLength(seq) {
+  if (seq.length < 2) return 1;
+
+  let length = 1;
+
+  for (let i = seq.length - 1; i > 0; i--) {
+    if (seq[i] !== seq[i - 1]) {
+      length++;
+    } else {
+      break;
+    }
+  }
+
+  return length;
+}
+
+function predictAlternation(seq) {
+  if (seq.length < 6) return 0.5;
+
+  const run = getAlternationLength(seq);
+  const last = seq[seq.length - 1];
+
+  let continueCount = 1;
+  let breakCount = 1;
+  let matches = 0;
+
+  // Tìm các chuỗi luân phiên tương tự trong 200 phiên.
+  for (let end = 1; end < seq.length - 1; end++) {
+    let oldRun = 1;
+
+    for (let j = end; j > 0; j--) {
+      if (seq[j] !== seq[j - 1]) {
+        oldRun++;
+      } else {
+        break;
+      }
+    }
+
+    if (oldRun !== run) continue;
+    if (seq[end] !== last) continue;
+
+    const next = seq[end + 1];
+
+    if (next !== last) continueCount++;
+    else breakCount++;
+
+    matches++;
+  }
+
+  // Khi chuỗi hiện tại đang luân phiên mạnh,
+  // ưu tiên kết quả đối diện nhưng phải có dữ liệu hỗ trợ.
+  if (run >= 3 && matches >= 2) {
+    const pOpposite =
+      continueCount / (continueCount + breakCount);
+
+    return last === 1
+      ? 1 - pOpposite
+      : pOpposite;
+  }
+
+  // Không đủ mẫu thì trở về trung tính.
+  return 0.5;
+}
+
+// =====================================================
+// 5. MODEL 2: MULTI-ORDER MARKOV
+// =====================================================
+
+function predictMarkov(seq) {
+  if (seq.length < 8) return 0.5;
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (let order = 1; order <= 6; order++) {
+    if (seq.length <= order + 3) continue;
+
+    const key = seq.slice(-order).join('');
+
+    let tai = 1;
+    let xiu = 1;
+    let matches = 0;
+
+    for (let i = order; i < seq.length; i++) {
+      const previous = seq
+        .slice(i - order, i)
+        .join('');
+
+      if (previous !== key) continue;
+
+      if (seq[i] === 1) tai++;
+      else xiu++;
+
+      matches++;
+    }
+
+    if (matches < 2) continue;
+
+    const probability = tai / (tai + xiu);
+    const weight = Math.sqrt(matches) * order;
+
+    numerator += probability * weight;
+    denominator += weight;
+  }
+
+  return denominator
+    ? numerator / denominator
+    : 0.5;
+}
+
+// =====================================================
+// 6. MODEL 3: PATTERN INTELLIGENCE
+// =====================================================
+
+function predictPattern(seq) {
+  if (seq.length < 10) return 0.5;
+
+  const candidates = [];
+
+  for (let length = 3; length <= 10; length++) {
+    if (seq.length <= length + 2) continue;
+
+    const target = seq.slice(-length);
+
+    let tai = 1;
+    let xiu = 1;
+    let matches = 0;
+
+    for (let i = length; i < seq.length; i++) {
+      let equal = true;
+
+      for (let j = 0; j < length; j++) {
+        if (seq[i - length + j] !== target[j]) {
+          equal = false;
+          break;
+        }
+      }
+
+      if (!equal) continue;
+
+      if (seq[i] === 1) tai++;
+      else xiu++;
+
+      matches++;
+    }
+
+    if (matches >= 2) {
+      const probability = tai / (tai + xiu);
+
+      // Ưu tiên mẫu dài và có số lần xuất hiện đủ.
+      const weight = Math.sqrt(matches) * Math.log2(length + 1);
+
+      candidates.push({ probability, weight, matches });
+    }
+  }
+
+  if (!candidates.length) return 0.5;
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const item of candidates) {
+    numerator += item.probability * item.weight;
+    denominator += item.weight;
+  }
+
+  return numerator / denominator;
+}
+
+// =====================================================
+// 7. MODEL 4: REGIME DETECTION
+// Phân loại: BỆT / ĐẢO / HỖN HỢP
+// =====================================================
+
+function detectRegime(seq) {
+  const recent = seq.slice(-20);
+
+  if (recent.length < 8) {
+    return {
+      type: 'INSUFFICIENT_DATA',
+      alternation: 0,
+      sameRate: 0.5,
+      streak: getAlternationLength(seq)
+    };
+  }
+
+  let switches = 0;
+
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i] !== recent[i - 1]) switches++;
+  }
+
+  const switchRate = switches / (recent.length - 1);
+  const sameRate = 1 - switchRate;
+
+  let streak = 1;
+
+  for (let i = recent.length - 1; i > 0; i--) {
+    if (recent[i] === recent[i - 1]) streak++;
+    else break;
+  }
+
+  let type = 'MIXED';
+
+  if (switchRate >= 0.75) {
+    type = 'ALTERNATING';
+  } else if (switchRate <= 0.35) {
+    type = 'STREAK';
+  }
+
+  return {
+    type,
+    alternation: switchRate,
+    sameRate,
+    streak
+  };
+}
+
+function predictRegime(seq) {
+  const regime = detectRegime(seq);
+
+  if (regime.type === 'INSUFFICIENT_DATA') {
+    return 0.5;
+  }
+
+  // Tìm lịch sử có trạng thái tương tự.
+  const currentType = regime.type;
+  let tai = 1;
+  let xiu = 1;
+  let matches = 0;
+
+  for (let end = 8; end < seq.length; end++) {
+    const sample = seq.slice(Math.max(0, end - 20), end);
+
+    if (sample.length < 8) continue;
+
+    let switches = 0;
+
+    for (let i = 1; i < sample.length; i++) {
+      if (sample[i] !== sample[i - 1]) switches++;
+    }
+
+    const rate = switches / (sample.length - 1);
+
+    let oldType = 'MIXED';
+
+    if (rate >= 0.75) oldType = 'ALTERNATING';
+    else if (rate <= 0.35) oldType = 'STREAK';
+
+    if (oldType !== currentType) continue;
+
+    if (seq[end] === 1) tai++;
+    else xiu++;
+
+    matches++;
+  }
+
+  if (matches < 3) return 0.5;
+
+  return tai / (tai + xiu);
+}
+
+// =====================================================
+// 8. MODEL 5: RECENT TREND
+// =====================================================
+
+function predictTrend(seq) {
+  if (seq.length < 5) return 0.5;
+
+  const windows = [8, 15, 30, 60, 100, 200];
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (let i = 0; i < windows.length; i++) {
+    const size = windows[i];
+
+    if (seq.length < Math.min(size, 5)) continue;
+
+    const sample = seq.slice(-size);
+    const p = mean(sample);
+
+    // Cửa sổ gần hiện tại có trọng số cao hơn.
+    const weight = Math.exp(-i * 0.38);
+
+    numerator += p * weight;
+    denominator += weight;
+  }
+
+  return denominator
+    ? numerator / denominator
+    : 0.5;
+}
+
+// =====================================================
+// 9. RUN FIVE MODELS
+// =====================================================
+
+function getModelPredictions(seq) {
+  return {
+    alternation: clamp(predictAlternation(seq), 0.01, 0.99),
+    markov: clamp(predictMarkov(seq), 0.01, 0.99),
+    pattern: clamp(predictPattern(seq), 0.01, 0.99),
+    regime: clamp(predictRegime(seq), 0.01, 0.99),
+    trend: clamp(predictTrend(seq), 0.01, 0.99)
+  };
+}
+
+// =====================================================
+// 10. ADAPTIVE META LEARNER
+// =====================================================
+
+function calculatePrediction(history) {
+  const seq = toSequence(history);
+  const models = getModelPredictions(seq);
+
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const name of MODEL_NAMES) {
+    const weight = clamp(AI.weights[name], 0.2, 4);
+
+    numerator += models[name] * weight;
+    denominator += weight;
+  }
+
+  let probability = denominator
+    ? numerator / denominator
+    : 0.5;
+
+  // Ít dữ liệu kiểm định thì giảm độ cực đoan.
+  const sampleFactor = Math.min(
+    1,
+    Math.sqrt(AI.stats.total / 50)
+  );
+
+  probability =
+    0.5 + (probability - 0.5) * sampleFactor;
+
+  // Khi các mô hình bất đồng mạnh, giảm độ tự tin.
+  const values = Object.values(models);
+  const disagreement = Math.sqrt(
+    mean(values.map(p => Math.pow(p - mean(values), 2)))
+  );
+
+  if (disagreement > 0.2) {
+    probability =
+      0.5 + (probability - 0.5) * 0.75;
+  }
+
+  probability = clamp(probability, 0.02, 0.98);
+
+  const final = probability >= 0.5 ? 'TÀI' : 'XỈU';
+
+  const confidence = Math.round(
+    clamp(50 + Math.abs(probability - 0.5) * 100, 50, 75)
+  );
+
+  return {
+    final,
+    probability,
+    confidence,
+    models,
+    disagreement
+  };
+}
+
+// =====================================================
+// 11. ONLINE LEARNING
+// =====================================================
+
+function learnFromPrediction(pending, actual) {
+  if (!pending || !pending.models) return;
+
+  const actualValue = actual.result;
+  const predicted = pending.probability >= 0.5 ? 1 : 0;
+  const win = predicted === actualValue;
+
+  AI.stats.total++;
+
+  if (win) AI.stats.win++;
+  else AI.stats.lose++;
+
+  for (const name of MODEL_NAMES) {
+    const p = clamp(
+      Number(pending.models[name] ?? 0.5),
+      0.01,
+      0.99
+    );
+
+    const loss = Math.pow(p - actualValue, 2);
+    const stats = AI.modelStats[name];
+
+    stats.total++;
+
+    if ((p >= 0.5 ? 1 : 0) === actualValue) {
+      stats.correct++;
+    }
+
+    stats.brier += loss;
+
+    stats.recentLosses.push(loss);
+
+    if (stats.recentLosses.length > LEARNING_WINDOW) {
+      stats.recentLosses.shift();
+    }
+
+    // Tự điều chỉnh theo lỗi gần đây.
+    const recentLoss = mean(stats.recentLosses);
+
+    const adjustment = Math.exp(
+      0.08 * (0.25 - recentLoss)
+    );
+
+    AI.weights[name] = clamp(
+      AI.weights[name] * adjustment,
+      0.2,
+      4
+    );
+  }
+
+  AI.compare.push({
+    phien: actual.id,
+    predict: pending.final,
+    real: actualValue === 1 ? 'TÀI' : 'XỈU',
+    win,
+    probability: Number(pending.probability.toFixed(4)),
+    time: new Date().toISOString()
+  });
+
+  if (AI.compare.length > 200) {
+    AI.compare = AI.compare.slice(-200);
+  }
+
+  AI.lastLearnedId = actual.id;
+
+  console.log(
+    `[LEARN] ${actual.id} | ${win ? 'WIN' : 'LOSE'} | ` +
+    `Accuracy ${(AI.stats.win / AI.stats.total * 100).toFixed(2)}%`
+  );
+}
+
+// =====================================================
+// 12. PENDING PREDICTION
+// =====================================================
+
+function createPending(history, targetId) {
+  const result = calculatePrediction(history);
+
+  return {
+    targetId,
+    final: result.final,
+    probability: result.probability,
+    confidence: result.confidence,
+    models: result.models,
+    createdAt: new Date().toISOString()
+  };
+}
+
+// =====================================================
+// 13. PROCESS EACH SESSION IN ORDER
+// =====================================================
+
+function processSession(session, history) {
+  if (AI.pending) {
+    if (AI.pending.targetId === session.id) {
+      learnFromPrediction(AI.pending, session);
+    } else if (AI.pending.targetId < session.id) {
+      console.log(
+        `[LEARN SKIP] Missing session ${AI.pending.targetId}`
+      );
+    } else {
+      console.log(
+        `[LEARN SKIP] Unexpected session ${session.id}`
+      );
+    }
+
+    AI.pending = null;
+  }
+
+  history.push(session);
+
+  if (history.length > ANALYSIS_WINDOW) {
+    history.splice(0, history.length - ANALYSIS_WINDOW);
+  }
+
+  AI.pending = createPending(history, session.id + 1);
+}
+
+// =====================================================
+// 14. SOURCE NORMALIZATION
 // =====================================================
 
 async function fetchSource() {
@@ -167,9 +719,7 @@ async function fetchSource() {
 }
 
 function normalizeSession(raw) {
-  const id = Number(
-    raw.id ?? raw.session ?? raw.issue
-  );
+  const id = Number(raw.id ?? raw.session ?? raw.issue);
 
   const rawDices =
     raw.dices ??
@@ -216,476 +766,10 @@ function normalizeSession(raw) {
 }
 
 // =====================================================
-// 4. COMMON FUNCTIONS
-// =====================================================
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function average(arr) {
-  if (!arr.length) return 0.5;
-
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
-}
-
-function binaryEntropy(p) {
-  p = clamp(p, 0.000001, 0.999999);
-
-  return -(
-    p * Math.log2(p) +
-    (1 - p) * Math.log2(1 - p)
-  );
-}
-
-// =====================================================
-// 5. MODEL 1: RECENCY BAYES
-// Dữ liệu mới có trọng số lớn hơn dữ liệu cũ.
-// =====================================================
-
-function predictRecent(seq) {
-  if (!seq.length) return 0.5;
-
-  let weightedTai = 1;
-  let weightedXiu = 1;
-  let weight = 1;
-
-  for (let i = seq.length - 1; i >= 0; i--) {
-    if (seq[i] === 1) {
-      weightedTai += weight;
-    } else {
-      weightedXiu += weight;
-    }
-
-    weight *= 0.975;
-
-    if (weight < 0.03) break;
-  }
-
-  return weightedTai / (weightedTai + weightedXiu);
-}
-
-// =====================================================
-// 6. MODEL 2: MULTI-ORDER MARKOV
-// Học xác suất kết quả tiếp theo theo nhiều cấp cầu.
-// =====================================================
-
-function predictMarkov(seq) {
-  if (seq.length < 5) return 0.5;
-
-  const predictions = [];
-  const weights = [];
-
-  for (let order = 1; order <= 5; order++) {
-    if (seq.length <= order + 2) continue;
-
-    const key = seq.slice(-order).join('');
-
-    let tai = 1;
-    let xiu = 1;
-    let matches = 0;
-
-    for (let i = order; i < seq.length; i++) {
-      const previous = seq
-        .slice(i - order, i)
-        .join('');
-
-      if (previous !== key) continue;
-
-      if (seq[i] === 1) tai++;
-      else xiu++;
-
-      matches++;
-    }
-
-    if (matches >= 2) {
-      predictions.push(tai / (tai + xiu));
-      weights.push(Math.sqrt(matches) * order);
-    }
-  }
-
-  if (!predictions.length) return 0.5;
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (let i = 0; i < predictions.length; i++) {
-    numerator += predictions[i] * weights[i];
-    denominator += weights[i];
-  }
-
-  return numerator / denominator;
-}
-
-// =====================================================
-// 7. MODEL 3: PATTERN RECOGNITION
-// Tìm những chuỗi tương tự trong lịch sử.
-// =====================================================
-
-function predictPattern(seq) {
-  if (seq.length < 8) return 0.5;
-
-  const predictions = [];
-  const weights = [];
-
-  for (let length = 3; length <= 8; length++) {
-    if (seq.length <= length + 3) continue;
-
-    const target = seq.slice(-length);
-
-    let tai = 1;
-    let xiu = 1;
-    let matches = 0;
-
-    for (
-      let i = length;
-      i < seq.length;
-      i++
-    ) {
-      const oldPattern = seq.slice(
-        i - length,
-        i
-      );
-
-      if (
-        oldPattern.every(
-          (value, index) => value === target[index]
-        )
-      ) {
-        if (seq[i] === 1) tai++;
-        else xiu++;
-
-        matches++;
-      }
-    }
-
-    if (matches >= 1) {
-      const probability = tai / (tai + xiu);
-
-      predictions.push(probability);
-      weights.push(Math.sqrt(matches) * length);
-    }
-  }
-
-  if (!predictions.length) return 0.5;
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (let i = 0; i < predictions.length; i++) {
-    numerator += predictions[i] * weights[i];
-    denominator += weights[i];
-  }
-
-  return numerator / denominator;
-}
-
-// =====================================================
-// 8. MODEL 4: TREND ANALYSIS
-// Phân tích xu hướng nhiều cửa sổ thời gian.
-// =====================================================
-
-function predictTrend(seq) {
-  if (!seq.length) return 0.5;
-
-  const windows = [8, 15, 30, 60, 120];
-  const weights = [1, 1.3, 1.5, 1.2, 0.8];
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (let i = 0; i < windows.length; i++) {
-    const size = windows[i];
-
-    if (seq.length < Math.min(size, 5)) {
-      continue;
-    }
-
-    const sample = seq.slice(-size);
-    const p = average(sample);
-
-    numerator += p * weights[i];
-    denominator += weights[i];
-  }
-
-  if (!denominator) return 0.5;
-
-  return numerator / denominator;
-}
-
-// =====================================================
-// 9. MODEL 5: STREAK / REVERSAL
-// Không mặc định cầu bệt hay cầu đảo.
-// Dùng thống kê thực tế sau các chuỗi tương tự.
-// =====================================================
-
-function predictStreak(seq) {
-  if (seq.length < 8) return 0.5;
-
-  const last = seq[seq.length - 1];
-
-  let streak = 1;
-
-  for (let i = seq.length - 2; i >= 0; i--) {
-    if (seq[i] === last) streak++;
-    else break;
-  }
-
-  let tai = 1;
-  let xiu = 1;
-  let matches = 0;
-
-  for (let i = 1; i < seq.length; i++) {
-    let oldStreak = 1;
-
-    for (let j = i - 2; j >= 0; j--) {
-      if (seq[j] === seq[i - 1]) {
-        oldStreak++;
-      } else {
-        break;
-      }
-    }
-
-    if (
-      seq[i - 1] === last &&
-      oldStreak === streak
-    ) {
-      if (seq[i] === 1) tai++;
-      else xiu++;
-
-      matches++;
-    }
-  }
-
-  if (matches < 2) return 0.5;
-
-  return tai / (tai + xiu);
-}
-
-// =====================================================
-// 10. GET ALL MODEL PREDICTIONS
-// =====================================================
-
-function getModelPredictions(seq) {
-  return {
-    recent: clamp(predictRecent(seq), 0.01, 0.99),
-    markov: clamp(predictMarkov(seq), 0.01, 0.99),
-    pattern: clamp(predictPattern(seq), 0.01, 0.99),
-    trend: clamp(predictTrend(seq), 0.01, 0.99),
-    streak: clamp(predictStreak(seq), 0.01, 0.99)
-  };
-}
-
-// =====================================================
-// 11. ADAPTIVE ENSEMBLE
-// Tự điều chỉnh trọng số theo hiệu quả từng mô hình.
-// =====================================================
-
-function calculatePrediction(history) {
-  const seq = history.map(h => h.result);
-  const models = getModelPredictions(seq);
-
-  let numerator = 0;
-  let denominator = 0;
-
-  for (const name of Object.keys(models)) {
-    const weight = clamp(
-      Number(AI.weights[name]) || 1,
-      0.2,
-      5
-    );
-
-    numerator += models[name] * weight;
-    denominator += weight;
-  }
-
-  let probability = denominator
-    ? numerator / denominator
-    : 0.5;
-
-  // Ít dữ liệu học được -> giảm độ cực đoan.
-  const learned = AI.stats.total;
-  const reliability = Math.min(
-    1,
-    Math.sqrt(learned / 40)
-  );
-
-  probability =
-    0.5 + (probability - 0.5) * reliability;
-
-  // Khi dữ liệu gần đây quá khó phân biệt,
-  // không ép mô hình đưa ra xác suất quá cực đoan.
-  const recent = seq.slice(-30);
-  const uncertainty = recent.length >= 15
-    ? binaryEntropy(average(recent))
-    : 1;
-
-  if (uncertainty > 0.97) {
-    probability =
-      0.5 + (probability - 0.5) * 0.75;
-  }
-
-  probability = clamp(probability, 0.01, 0.99);
-
-  const final = probability >= 0.5
-    ? 'TÀI'
-    : 'XỈU';
-
-  // Đây là điểm độ mạnh dự đoán, không phải
-  // xác suất thắng đã được kiểm chứng.
-  const confidence = clamp(
-    50 + Math.abs(probability - 0.5) * 100,
-    50,
-    75
-  );
-
-  return {
-    final,
-    probability,
-    confidence: Math.round(confidence),
-    models
-  };
-}
-
-// =====================================================
-// 12. ONLINE LEARNING
-// Chấm từng mô hình riêng biệt bằng Brier Score.
-// =====================================================
-
-function learnFromPrediction(pending, actual) {
-  if (!pending || !pending.models) return;
-
-  const actualValue = actual === 1 ? 1 : 0;
-  const predictedFinal = pending.probability >= 0.5 ? 1 : 0;
-  const win = predictedFinal === actualValue;
-
-  AI.stats.total++;
-
-  if (win) AI.stats.win++;
-  else AI.stats.lose++;
-
-  const names = Object.keys(AI.weights);
-
-  for (const name of names) {
-    const p = clamp(
-      Number(pending.models[name] ?? 0.5),
-      0,
-      1
-    );
-
-    const loss = Math.pow(p - actualValue, 2);
-    const stats = AI.modelStats[name];
-
-    stats.total++;
-    stats.brier += loss;
-
-    if ((p >= 0.5 ? 1 : 0) === actualValue) {
-      stats.correct++;
-    }
-
-    // Mô hình có Brier loss thấp hơn 0.25
-    // được tăng trọng số; mô hình kém bị giảm.
-    const eta = 0.12;
-    const adjustment = Math.exp(
-      eta * (0.25 - loss)
-    );
-
-    AI.weights[name] = clamp(
-      AI.weights[name] * adjustment,
-      0.2,
-      5
-    );
-  }
-
-  AI.compare.push({
-    phien: actual.id,
-    predict: pending.final,
-    real: actualValue === 1 ? 'TÀI' : 'XỈU',
-    win,
-    probability: Number(
-      pending.probability.toFixed(4)
-    ),
-    time: new Date().toISOString()
-  });
-
-  if (AI.compare.length > 100) {
-    AI.compare = AI.compare.slice(-100);
-  }
-
-  AI.lastLearnedId = actual.id;
-
-  console.log(
-    `[LEARN] Session ${actual.id} | ` +
-    `${win ? 'WIN' : 'LOSE'} | ` +
-    `Accuracy ${(
-      AI.stats.win / AI.stats.total * 100
-    ).toFixed(2)}%`
-  );
-}
-
-// =====================================================
-// 13. CREATE NEXT PREDICTION
-// =====================================================
-
-function createPending(history, targetId) {
-  if (!history.length) return null;
-
-  const prediction = calculatePrediction(history);
-
-  return {
-    targetId,
-    final: prediction.final,
-    probability: prediction.probability,
-    confidence: prediction.confidence,
-    models: prediction.models,
-    createdAt: new Date().toISOString()
-  };
-}
-
-// =====================================================
-// 14. SESSION PROCESSING
-// Chấm đúng từng phiên, kể cả khi API trả về nhiều phiên.
-// =====================================================
-
-function processSession(session, history) {
-  if (AI.pending) {
-    if (AI.pending.targetId === session.id) {
-      learnFromPrediction(AI.pending, session);
-      AI.pending = null;
-    } else if (AI.pending.targetId < session.id) {
-      // Bị thiếu phiên: không lấy kết quả sai phiên
-      // để chấm điểm dự đoán cũ.
-      console.log(
-        `[LEARN] Skip missing target ${AI.pending.targetId}`
-      );
-
-      AI.pending = null;
-    }
-  }
-
-  history.push(session);
-
-  if (history.length > MAX_HISTORY) {
-    history.splice(0, history.length - MAX_HISTORY);
-  }
-
-  // Dự đoán cho phiên kế tiếp.
-  AI.pending = createPending(
-    history,
-    session.id + 1
-  );
-}
-
-// =====================================================
-// 15. SYNC SOURCE
+// 15. SYNC
 // =====================================================
 
 let syncInProgress = false;
-let lastId = 0;
 
 async function syncData() {
   if (syncInProgress) return;
@@ -699,21 +783,16 @@ async function syncData() {
       ? raw
       : raw.data ?? raw.sessions ?? raw.list ?? [];
 
-    if (!Array.isArray(list) || !list.length) {
-      return;
-    }
+    if (!Array.isArray(list) || !list.length) return;
 
     const history = readHistory();
-    const knownIds = new Set(history.map(h => Number(h.id)));
+    const knownIds = new Set(
+      history.map(x => Number(x.id))
+    );
 
     const fresh = list
       .map(normalizeSession)
-      .filter(s =>
-        s &&
-        Number.isFinite(s.id) &&
-        [0, 1].includes(s.result) &&
-        !knownIds.has(s.id)
-      )
+      .filter(s => s && !knownIds.has(s.id))
       .sort((a, b) => a.id - b.id);
 
     if (!fresh.length) return;
@@ -724,9 +803,7 @@ async function syncData() {
       if (knownIds.has(session.id)) continue;
 
       processSession(session, history);
-
       knownIds.add(session.id);
-      lastId = Math.max(lastId, session.id);
       added++;
     }
 
@@ -734,11 +811,10 @@ async function syncData() {
       history.sort((a, b) => a.id - b.id);
 
       writeHistory(history);
-      saveAIState();
+      saveState();
 
       console.log(
-        `[SYNC] +${added} sessions | ` +
-        `History ${history.length} | ` +
+        `[SYNC] +${added} | History ${history.length} | ` +
         `Learned ${AI.stats.total}`
       );
     }
@@ -750,7 +826,7 @@ async function syncData() {
 }
 
 // =====================================================
-// 16. VIETNAM TIME
+// 16. TIME
 // =====================================================
 
 function formatTimeVN() {
@@ -760,7 +836,7 @@ function formatTimeVN() {
 }
 
 // =====================================================
-// 17. API RESPONSE
+// 17. MAIN RESPONSE
 // =====================================================
 
 function buildResponse() {
@@ -775,10 +851,7 @@ function buildResponse() {
   }
 
   const current = history[history.length - 1];
-
   const prediction = calculatePrediction(history);
-
-  const targetId = current.id + 1;
 
   return {
     id: 'noname09',
@@ -787,44 +860,30 @@ function buildResponse() {
     xucxac: current.dices,
     tong: current.sum,
 
-    dudoanphien: targetId,
-    dudoan: prediction.final === 'TÀI'
-      ? 'tai'
-      : 'xiu',
-
+    dudoanphien: current.id + 1,
+    dudoan: prediction.final === 'TÀI' ? 'tai' : 'xiu',
     dotincay: `${prediction.confidence}%`,
     uptime: formatTimeVN(),
 
     ai: {
       version: AI.version,
-      probability: Number(
-        prediction.probability.toFixed(4)
-      ),
-      models: Object.fromEntries(
-        Object.entries(prediction.models).map(
-          ([key, value]) => [
-            key,
-            Number(value.toFixed(4))
-          ]
-        )
-      ),
+      window: Math.min(history.length, ANALYSIS_WINDOW),
+      probability: Number(prediction.probability.toFixed(4)),
+      disagreement: Number(prediction.disagreement.toFixed(4)),
+      models: prediction.models,
       weights: AI.weights,
-      learned: AI.stats.total,
+      total: AI.stats.total,
+      win: AI.stats.win,
+      lose: AI.stats.lose,
       accuracy: AI.stats.total
-        ? Number(
-            (
-              AI.stats.win /
-              AI.stats.total *
-              100
-            ).toFixed(2)
-          )
+        ? Number((AI.stats.win / AI.stats.total * 100).toFixed(2))
         : 0
     }
   };
 }
 
 // =====================================================
-// 18. API ROUTES
+// 18. ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
@@ -832,9 +891,7 @@ app.get('/', (req, res) => {
     res.json(buildResponse());
   } catch (err) {
     console.error('[API ERROR]', err.message);
-    res.status(500).json({
-      error: 'Internal server error'
-    });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -843,9 +900,7 @@ app.get('/predict', (req, res) => {
     res.json(buildResponse());
   } catch (err) {
     console.error('[PREDICT ERROR]', err.message);
-    res.status(500).json({
-      error: 'Prediction error'
-    });
+    res.status(500).json({ error: 'Prediction error' });
   }
 });
 
@@ -854,63 +909,49 @@ app.get('/ping', (req, res) => {
 });
 
 app.get('/history', (req, res) => {
-  try {
-    const history = readHistory();
+  const history = readHistory();
 
-    res.json({
-      count: history.length,
-      last20: history.slice(-20)
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: 'History error'
-    });
-  }
+  res.json({
+    count: history.length,
+    window: ANALYSIS_WINDOW,
+    last20: history.slice(-20)
+  });
 });
 
 app.get('/ai-status', (req, res) => {
-  const accuracy = AI.stats.total
-    ? AI.stats.win / AI.stats.total * 100
-    : 0;
+  const total = AI.stats.total;
 
-  const modelStatus = {};
+  const models = {};
 
-  for (const name of Object.keys(AI.weights)) {
+  for (const name of MODEL_NAMES) {
     const stats = AI.modelStats[name];
 
-    modelStatus[name] = {
-      weight: Number(
-        AI.weights[name].toFixed(4)
-      ),
+    models[name] = {
+      weight: Number(AI.weights[name].toFixed(4)),
       total: stats.total,
       accuracy: stats.total
-        ? Number(
-            (
-              stats.correct /
-              stats.total *
-              100
-            ).toFixed(2)
-          )
+        ? Number((stats.correct / stats.total * 100).toFixed(2))
         : 0,
       averageBrier: stats.total
-        ? Number(
-            (
-              stats.brier /
-              stats.total
-            ).toFixed(4)
-          )
+        ? Number((stats.brier / stats.total).toFixed(4))
+        : null,
+      recentBrier: stats.recentLosses.length
+        ? Number(mean(stats.recentLosses).toFixed(4))
         : null
     };
   }
 
   res.json({
     version: AI.version,
-    total: AI.stats.total,
+    total,
     win: AI.stats.win,
     lose: AI.stats.lose,
-    accuracy: Number(accuracy.toFixed(2)),
+    accuracy: total
+      ? Number((AI.stats.win / total * 100).toFixed(2))
+      : 0,
+    analysisWindow: ANALYSIS_WINDOW,
     weights: AI.weights,
-    models: modelStatus,
+    models,
     pending: AI.pending,
     lastLearnedId: AI.lastLearnedId
   });
@@ -924,51 +965,39 @@ if (!fs.existsSync(DATA_FILE)) {
   atomicWrite(DATA_FILE, '[]');
 }
 
-const bootHistory = readHistory();
+const bootHistory = readHistory().slice(-ANALYSIS_WINDOW);
 
 if (bootHistory.length) {
-  lastId = Math.max(
-    ...bootHistory.map(h => Number(h.id) || 0)
-  );
-
-  // Nếu chưa có dự đoán chờ, tạo lại dự đoán
-  // cho phiên kế tiếp từ lịch sử đã lưu.
   const current = bootHistory[bootHistory.length - 1];
 
+  // Chỉ giữ pending nếu nó đúng phiên kế tiếp.
   if (
     !AI.pending ||
-    AI.pending.targetId !== current.id + 1
+    Number(AI.pending.targetId) !== Number(current.id) + 1
   ) {
     AI.pending = createPending(
       bootHistory,
-      current.id + 1
+      Number(current.id) + 1
     );
 
-    saveAIState();
+    saveState();
   }
 }
 
-console.log('[BOOT] Adaptive AI V3');
+console.log('[BOOT] AI-ADAPTIVE-V4');
+console.log('[BOOT] Analysis window:', ANALYSIS_WINDOW);
 console.log('[BOOT] History:', bootHistory.length);
 console.log('[BOOT] Learned:', AI.stats.total);
 
 syncData();
 
-const syncTimer = setInterval(
-  syncData,
-  POLL_INTERVAL
-);
+const timer = setInterval(syncData, POLL_INTERVAL);
 
-if (typeof syncTimer.unref === 'function') {
-  syncTimer.unref();
+if (typeof timer.unref === 'function') {
+  timer.unref();
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `[SERVER] Running on port ${PORT}`
-  );
-
-  console.log(
-    `[SERVER] ${formatTimeVN()}`
-  );
+  console.log(`[SERVER] Running on ${PORT}`);
+  console.log(`[SERVER] ${formatTimeVN()}`);
 });
