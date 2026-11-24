@@ -23,6 +23,10 @@ app.use((req, res, next) => {
 });
 
 const DATA_FILE = path.join(__dirname, 'lichsulc79md5.json');
+
+// Chỉ file này được dùng để phân tích và học.
+const LEARNING_FILE = path.join(__dirname, 'learning_data.json');
+
 const MODEL_FILE = path.join(__dirname, 'algorithm_state.json');
 
 const SOURCE_API =
@@ -30,6 +34,8 @@ const SOURCE_API =
 
 const POLL_INTERVAL = 15000;
 const MAX_HISTORY = 500;
+const MAX_LEARNING = 500;
+const ANALYSIS_WINDOW = 300;
 const PORT = process.env.PORT || 3000;
 
 // =====================================================
@@ -39,6 +45,7 @@ const PORT = process.env.PORT || 3000;
 let lastPredict = null;
 let lastId = 0;
 let syncInProgress = false;
+let bootstrapped = false;
 
 const STATS = {
   total: 0,
@@ -71,44 +78,74 @@ function atomicWrite(file, data) {
 function initDataFile() {
   if (!fs.existsSync(DATA_FILE)) {
     fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-    console.log('[INIT] Created history');
-  } else {
-    console.log('[INIT] Existing history preserved');
   }
+
+  if (!fs.existsSync(LEARNING_FILE)) {
+    fs.writeFileSync(LEARNING_FILE, '[]', 'utf8');
+  }
+
+  console.log('[INIT] History and learning files ready');
 }
 
-function readHistory() {
+function readJsonArray(file) {
   try {
     const parsed = JSON.parse(
-      fs.readFileSync(DATA_FILE, 'utf8') || '[]'
+      fs.readFileSync(file, 'utf8') || '[]'
     );
 
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    console.error('[READ ERROR]', err.message);
+    console.error('[READ ERROR]', path.basename(file), err.message);
     return [];
   }
 }
 
-function writeHistory(history) {
-  atomicWrite(DATA_FILE, history);
+function readHistory() {
+  return readJsonArray(DATA_FILE);
 }
 
-// Giữ chức năng reset thủ công.
-// Không tự động xóa lịch sử khi dự đoán sai.
-function resetHistory() {
-  writeHistory([]);
+function readLearning() {
+  return readJsonArray(LEARNING_FILE);
+}
 
-  lastPredict = null;
-  lastId = 0;
+function writeHistory(data) {
+  atomicWrite(DATA_FILE, data);
+}
 
-  CAUTION.data = [];
-
-  console.log('[RESET] History cleared');
+function writeLearning(data) {
+  atomicWrite(LEARNING_FILE, data);
 }
 
 // =====================================================
-// 4. SOURCE API
+// 4. RESET 10 CAUTION SESSIONS
+// =====================================================
+
+function resetHistory(throughId = lastId) {
+  const safeId = Number(throughId) || 0;
+
+  writeHistory([]);
+  writeLearning([]);
+
+  lastPredict = null;
+  lastId = safeId;
+
+  CAUTION.data = [];
+
+  STATS.total = 0;
+  STATS.win = 0;
+  STATS.lose = 0;
+
+  COMPARE.length = 0;
+
+  bandit.reset();
+
+  console.log('[RESET] 10 caution sessions completed');
+  console.log('[RESET] Old history cleared');
+  console.log('[RESET] New learning cycle started');
+}
+
+// =====================================================
+// 5. SOURCE API
 // =====================================================
 
 async function fetchSource() {
@@ -129,7 +166,7 @@ async function fetchSource() {
 }
 
 // =====================================================
-// 5. NORMALIZE SESSION
+// 6. NORMALIZE SESSION
 // =====================================================
 
 function normalizeSession(raw) {
@@ -144,9 +181,13 @@ function normalizeSession(raw) {
     ? rawDices.map(Number)
     : [];
 
-  const sum = dices.length
+  const validDices =
+    dices.length === 3 &&
+    dices.every(d => Number.isInteger(d) && d >= 1 && d <= 6);
+
+  const sum = validDices
     ? dices.reduce((a, b) => a + b, 0)
-    : Number(raw.sum ?? 0);
+    : Number(raw.sum ?? raw.total ?? 0);
 
   const sourceResult = String(
     raw.resultTruyenThong ??
@@ -161,158 +202,210 @@ function normalizeSession(raw) {
   } else if (['XIU', 'XỈU', 'SMALL'].includes(sourceResult)) {
     result = 0;
   } else {
+    if (!Number.isFinite(sum) || sum < 3 || sum > 18) {
+      return null;
+    }
+
     result = sum >= 11 ? 1 : 0;
+  }
+
+  if (!Number.isFinite(Number(id))) {
+    return null;
+  }
+
+  if (!Number.isFinite(sum) || sum < 3 || sum > 18) {
+    return null;
   }
 
   return {
     id: Number(id),
     _id: String(raw._id ?? id),
-    dices,
+    dices: validDices ? dices : [],
     sum,
     result
   };
 }
 
 // =====================================================
-// 6. BAYESIAN ENGINE
+// 7. COMMON FUNCTIONS
+// =====================================================
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getRecent(seq, size = ANALYSIS_WINDOW) {
+  return seq.slice(-size);
+}
+
+function getBaseProbability(seq) {
+  if (!seq.length) return 0.5;
+
+  const recent = getRecent(seq, 100);
+
+  const ones = recent.reduce((a, b) => a + b, 0);
+
+  return (ones + 1) / (recent.length + 2);
+}
+
+// =====================================================
+// 8. BAYESIAN ADAPTIVE MODEL
 // =====================================================
 
 class BayesianModel {
   predict(seq) {
-    if (!seq.length) return 0.5;
+    if (seq.length < 5) return 0.5;
 
-    const recent = seq.slice(-100);
+    const recent = getRecent(seq, 100);
 
-    const ones = recent.reduce(
-      (a, b) => a + b,
-      0
-    );
+    let weightedOnes = 0;
+    let totalWeight = 0;
 
-    return (ones + 1) / (recent.length + 2);
+    for (let i = 0; i < recent.length; i++) {
+      const age = recent.length - 1 - i;
+
+      const weight = Math.exp(-age / 50);
+
+      weightedOnes += recent[i] * weight;
+      totalWeight += weight;
+    }
+
+    // Prior cân bằng, tránh kết luận quá sớm.
+    const probability =
+      (weightedOnes + 2) /
+      (totalWeight + 4);
+
+    return clamp(probability, 0.05, 0.95);
   }
 }
 
 // =====================================================
-// 7. MARKOV CHAIN ENGINE
+// 9. MARKOV MODEL
 // =====================================================
 
 class HMMModel {
   predict(seq) {
-    if (seq.length < 5) return 0.5;
+    if (seq.length < 10) return 0.5;
+
+    const recent = getRecent(seq, 250);
+    const base = getBaseProbability(recent);
 
     let numerator = 0;
     let denominator = 0;
 
-    const maxOrder = Math.min(3, seq.length - 1);
+    const maxOrder = Math.min(3, recent.length - 1);
 
     for (let order = 1; order <= maxOrder; order++) {
-      const context = seq.slice(-order);
+      const context = recent.slice(-order);
 
-      let total = 0;
-      let ones = 0;
+      let weightedOnes = 0;
+      let totalWeight = 0;
+      let count = 0;
 
-      for (
-        let i = order;
-        i < seq.length;
-        i++
-      ) {
+      for (let i = order; i < recent.length; i++) {
         let matched = true;
 
         for (let j = 0; j < order; j++) {
-          if (seq[i - order + j] !== context[j]) {
+          if (recent[i - order + j] !== context[j]) {
             matched = false;
             break;
           }
         }
 
-        if (matched) {
-          total++;
-          ones += seq[i];
-        }
+        if (!matched) continue;
+
+        const age = recent.length - 1 - i;
+        const weight = Math.exp(-age / 100);
+
+        weightedOnes += recent[i] * weight;
+        totalWeight += weight;
+        count++;
       }
 
-      if (!total) continue;
+      if (!count) continue;
 
-      const p = (ones + 2) / (total + 4);
+      const probability =
+        (weightedOnes + base * 5) /
+        (totalWeight + 5);
 
-      const weight = total / (total + 5);
+      const reliability =
+        totalWeight / (totalWeight + 5);
 
-      numerator += p * weight;
-      denominator += weight;
+      numerator += probability * reliability;
+      denominator += reliability;
     }
 
     return denominator
-      ? numerator / denominator
+      ? clamp(numerator / denominator, 0.05, 0.95)
       : 0.5;
   }
 }
 
 // =====================================================
-// 8. PATTERN RECOGNITION ENGINE
+// 10. PATTERN RECOGNITION
 // =====================================================
 
 function patternAnalysis(seq) {
-  if (seq.length < 8) {
+  if (seq.length < 15) {
     return {
       probability: 0.5,
       support: 0
     };
   }
 
-  const recent = seq.slice(-100);
-
-  const base =
-    recent.reduce((a, b) => a + b, 0) /
-    recent.length;
-
-  const maxLength = Math.min(6, seq.length - 1);
+  const recent = getRecent(seq, 250);
+  const base = getBaseProbability(recent);
 
   let numerator = 0;
   let denominator = 0;
   let support = 0;
 
+  const maxLength = Math.min(5, recent.length - 1);
+
   for (let length = 2; length <= maxLength; length++) {
-    const pattern = seq.slice(-length);
+    const pattern = recent.slice(-length);
 
+    let weightedOnes = 0;
+    let totalWeight = 0;
     let count = 0;
-    let ones = 0;
 
-    for (
-      let end = length - 1;
-      end < seq.length - 1;
-      end++
-    ) {
+    for (let end = length - 1; end < recent.length - 1; end++) {
       let matched = true;
 
       for (let j = 0; j < length; j++) {
-        if (
-          seq[end - length + 1 + j] !== pattern[j]
-        ) {
+        if (recent[end - length + 1 + j] !== pattern[j]) {
           matched = false;
           break;
         }
       }
 
-      if (matched) {
-        count++;
-        ones += seq[end + 1];
-      }
+      if (!matched) continue;
+
+      const age = recent.length - 1 - end;
+      const weight = Math.exp(-age / 100);
+
+      weightedOnes += recent[end + 1] * weight;
+      totalWeight += weight;
+      count++;
     }
 
     if (!count) continue;
 
-    const p = (ones + base * 6) / (count + 6);
+    const probability =
+      (weightedOnes + base * 5) /
+      (totalWeight + 5);
 
-    const weight = count / (count + 6);
+    const reliability =
+      totalWeight / (totalWeight + 5);
 
-    numerator += p * weight;
-    denominator += weight;
+    numerator += probability * reliability;
+    denominator += reliability;
     support += count;
   }
 
   return {
     probability: denominator
-      ? numerator / denominator
+      ? clamp(numerator / denominator, 0.05, 0.95)
       : 0.5,
 
     support
@@ -320,7 +413,7 @@ function patternAnalysis(seq) {
 }
 
 // =====================================================
-// 9. STREAK DETECTOR
+// 11. STREAK DETECTOR
 // =====================================================
 
 function getCurrentStreak(seq) {
@@ -359,13 +452,54 @@ function streakBucket(length) {
 }
 
 // =====================================================
-// 10. ADVANCED REVERSAL ENGINE
+// 12. COMPLETE RUN DETECTION
+// =====================================================
+
+function getRuns(seq) {
+  if (!seq.length) return [];
+
+  const runs = [];
+
+  let side = seq[0];
+  let length = 1;
+  let start = 0;
+
+  for (let i = 1; i < seq.length; i++) {
+    if (seq[i] === side) {
+      length++;
+    } else {
+      runs.push({
+        side,
+        length,
+        start,
+        end: i - 1,
+        next: seq[i]
+      });
+
+      side = seq[i];
+      length = 1;
+      start = i;
+    }
+  }
+
+  runs.push({
+    side,
+    length,
+    start,
+    end: seq.length - 1,
+    next: null
+  });
+
+  return runs;
+}
+
+// =====================================================
+// 13. REVERSAL ENGINE
 // =====================================================
 
 class ReversalEngine {
-
   analyze(seq) {
-    if (seq.length < 10) {
+    if (seq.length < 20) {
       return {
         probability: 0.5,
         reversalProbability: 0.5,
@@ -381,69 +515,58 @@ class ReversalEngine {
 
     const side = current.side;
     const streak = current.length;
-
     const bucket = streakBucket(streak);
 
-    let total = 0;
-    let reverseCount = 0;
-    let continueCount = 0;
+    const recent = getRecent(seq, 300);
+    const runs = getRuns(recent);
 
-    // Tìm các trường hợp lịch sử có:
-    // - Cùng phía Tài/Xỉu
-    // - Cùng nhóm độ dài cầu
-    // - Có kết quả tiếp theo để kiểm chứng
+    let reverseWeight = 0;
+    let continueWeight = 0;
+    let totalWeight = 0;
+    let support = 0;
 
-    for (let i = 1; i < seq.length - 1; i++) {
-      if (seq[i] !== side) continue;
+    // Chỉ lấy các chuỗi đã hoàn tất.
+    // Không tính từng vị trí trong cùng một chuỗi.
 
-      let historicalStreak = 1;
+    for (let i = 0; i < runs.length - 1; i++) {
+      const run = runs[i];
 
-      for (let j = i - 1; j >= 0; j--) {
-        if (seq[j] === seq[i]) {
-          historicalStreak++;
-        } else {
-          break;
-        }
-      }
+      if (run.side !== side) continue;
 
-      if (
-        streakBucket(historicalStreak) !== bucket
-      ) {
+      if (streakBucket(run.length) !== bucket) {
         continue;
       }
 
-      const next = seq[i + 1];
+      if (run.next === null) continue;
 
-      total++;
+      const age = recent.length - 1 - run.end;
+      const weight = Math.exp(-age / 150);
 
-      if (next !== side) {
-        reverseCount++;
+      totalWeight += weight;
+      support++;
+
+      if (run.next !== side) {
+        reverseWeight += weight;
       } else {
-        continueCount++;
+        continueWeight += weight;
       }
     }
 
-    // Chỉ sử dụng dữ liệu lịch sử gần đây
-    // để hạn chế ảnh hưởng của mẫu quá cũ.
-    // Mỗi điểm dữ liệu là một vị trí kết thúc cầu.
-    //
-    // Làm mượt bằng 6 mẫu giả định cân bằng.
-    // Không sử dụng random.
-
+    // Prior cân bằng: 3 đảo, 3 tiếp tục.
     const reversalProbability =
-      (reverseCount + 3) / (total + 6);
+      (reverseWeight + 3) / (totalWeight + 6);
 
     const continuationProbability =
-      (continueCount + 3) / (total + 6);
+      (continueWeight + 3) / (totalWeight + 6);
 
-    // Chuyển xác suất đảo chiều thành xác suất Tài.
+    // Xác suất Tài của phiên kế tiếp.
     const probability = side === 1
-      ? 1 - reversalProbability
+      ? continuationProbability
       : reversalProbability;
 
     let signal = 'NEUTRAL';
 
-    if (total >= 8) {
+    if (support >= 8) {
       if (reversalProbability >= 0.60) {
         signal = 'REVERSAL';
       } else if (reversalProbability <= 0.40) {
@@ -455,7 +578,7 @@ class ReversalEngine {
       probability,
       reversalProbability,
       continuationProbability,
-      support: total,
+      support,
       streak,
       side,
       bucket,
@@ -465,7 +588,7 @@ class ReversalEngine {
 }
 
 // =====================================================
-// 11. ENTROPY DETECTOR
+// 14. ENTROPY
 // =====================================================
 
 function entropy(seq, windowSize = 30) {
@@ -487,16 +610,8 @@ function entropy(seq, windowSize = 30) {
   );
 }
 
-function chaosBlock(seq) {
-  if (seq.length < 30) return false;
-
-  // Entropy cao không tự động đồng nghĩa với cầu đảo.
-  // Chỉ sử dụng như một chỉ báo bất định.
-  return entropy(seq, 30) > 0.92;
-}
-
 // =====================================================
-// 12. ADAPTIVE BANDIT
+// 15. ADAPTIVE BANDIT
 // =====================================================
 
 class Bandit {
@@ -565,30 +680,29 @@ class Bandit {
 
     const old = this.weight(name);
 
-    const error = Math.pow(
-      predicted - actual,
-      2
-    );
+    const error = Math.pow(predicted - actual, 2);
 
-    // Brier error:
-    // 0 = dự đoán xác suất hoàn hảo
-    // 0.25 = dự đoán 50/50
-    // 1 = dự đoán xác suất sai hoàn toàn
-
+    // Cập nhật theo Brier Score.
     const updated =
       old * Math.exp(0.12 * (0.25 - error));
 
-    this.score[name] = Math.max(
-      0.4,
-      Math.min(2, updated)
-    );
+    this.score[name] = clamp(updated, 0.4, 2);
+  }
+
+  reset() {
+    this.score = {
+      bayes: 1,
+      markov: 1,
+      pattern: 1,
+      reversal: 1
+    };
 
     this.save();
   }
 }
 
 // =====================================================
-// 13. INITIALIZE MODELS
+// 16. INITIALIZE MODELS
 // =====================================================
 
 const bayes = new BayesianModel();
@@ -597,14 +711,37 @@ const reversalEngine = new ReversalEngine();
 const bandit = new Bandit();
 
 // =====================================================
-// 14. ENSEMBLE PREDICTION
+// 17. ENSEMBLE PREDICTION
 // =====================================================
 
-function calculateFinal(seq, id) {
+function calculateFinal(seq) {
   const n = seq.length;
 
-  const reversal = reversalEngine.analyze(seq);
+  const insufficient = n < 10;
 
+  if (insufficient) {
+    return {
+      final: 'CHƯA ĐỦ DỮ LIỆU',
+      confidence: 0,
+      caution: true,
+      probability: 0.5,
+      components: {
+        bayes: 0.5,
+        markov: 0.5,
+        pattern: 0.5,
+        reversal: 0.5
+      },
+      agreement: 0,
+      reversal: reversalEngine.analyze(seq),
+      pattern: {
+        probability: 0.5,
+        support: 0
+      },
+      entropy: 0
+    };
+  }
+
+  const reversal = reversalEngine.analyze(seq);
   const pattern = patternAnalysis(seq);
 
   const components = {
@@ -632,40 +769,39 @@ function calculateFinal(seq, id) {
     ? 'TÀI'
     : 'XỈU';
 
-  // Mức độ đồng thuận giữa các mô hình
+  // Đo mức độ đồng thuận.
   const agreement = Object.values(components)
     .filter(p =>
       (probability >= 0.5 && p >= 0.5) ||
       (probability < 0.5 && p < 0.5)
     ).length / 4;
 
-  // Hệ số dữ liệu
-  const dataFactor = Math.min(1, n / 100);
-
-  // Bằng chứng lịch sử của mô hình đảo cầu
-  const reversalFactor = Math.min(
-    1,
-    reversal.support / 20
-  );
-
   const strength = Math.abs(probability - 0.5);
 
-  // Chỉ số tham khảo, không phải xác suất thắng đã hiệu chuẩn
+  const dataFactor = Math.min(1, n / 100);
+
+  const supportFactor = Math.min(
+    1,
+    reversal.support / 15
+  );
+
+  // Confidence là chỉ số tham khảo, không phải xác suất thắng.
   const confidence = Math.round(
-    Math.min(
-      75,
+    clamp(
       50 +
       strength * 100 *
       agreement *
       dataFactor *
-      (0.7 + 0.3 * reversalFactor)
+      (0.7 + 0.3 * supportFactor),
+      0,
+      75
     ) * 100
   ) / 100;
 
   const caution =
     n < 30 ||
     agreement < 0.5 ||
-    Math.abs(probability - 0.5) < 0.06 ||
+    strength < 0.06 ||
     reversal.support < 4;
 
   return {
@@ -682,19 +818,20 @@ function calculateFinal(seq, id) {
 }
 
 // =====================================================
-// 15. PROCESS LATEST SESSION
+// 18. PROCESS NEW SESSION
 // =====================================================
 
 function processLatest(session) {
-  const seq = readHistory().map(h => h.result);
+  // Chỉ đọc dữ liệu học mới.
+  const learning = readLearning();
 
-  // Chấm dự đoán của phiên trước
+  const seq = learning.map(h => h.result);
+
+  // Chấm dự đoán trước đó.
   if (lastPredict) {
     const actual = session.result;
 
-    const real = actual === 1
-      ? 'TÀI'
-      : 'XỈU';
+    const real = actual === 1 ? 'TÀI' : 'XỈU';
 
     const win = lastPredict.predict === real;
 
@@ -706,7 +843,7 @@ function processLatest(session) {
       STATS.lose++;
     }
 
-    // Mỗi mô hình được đánh giá độc lập
+    // Cập nhật từng mô hình bằng dự đoán đã lưu trước đó.
     if (lastPredict.components) {
       for (const name of [
         'bayes',
@@ -720,6 +857,8 @@ function processLatest(session) {
           actual
         );
       }
+
+      bandit.save();
     }
 
     COMPARE.push({
@@ -729,41 +868,82 @@ function processLatest(session) {
       win
     });
 
-    if (COMPARE.length > 10) {
+    if (COMPARE.length > 20) {
       COMPARE.shift();
     }
 
-    // Giữ thống kê CAUTION cũ
-    if (lastPredict.caution) {
-      CAUTION.data.push(win ? 1 : 0);
-
-      if (CAUTION.data.length > 10) {
-        CAUTION.data.shift();
-      }
-    }
-
     console.log(
-      `[RESULT] Session ${session.id} | ` +
+      `[RESULT] ${session.id} | ` +
       `${lastPredict.predict} | ${real} | ` +
       `${win ? 'WIN' : 'LOSE'}`
     );
+
+    // Chỉ tính kết quả của những dự đoán cảnh báo.
+    if (lastPredict.caution) {
+      CAUTION.data.push(win ? 1 : 0);
+
+      console.log(
+        `[CAUTION] ${CAUTION.data.length}/10 | ` +
+        `Win: ${CAUTION.data.filter(x => x === 1).length} | ` +
+        `Lose: ${CAUTION.data.filter(x => x === 0).length}`
+      );
+
+      // Đủ 10 dự đoán cảnh báo thì kiểm tra reset.
+      if (CAUTION.data.length >= 10) {
+        const wins = CAUTION.data.filter(x => x === 1).length;
+        const loses = CAUTION.data.filter(x => x === 0).length;
+
+        if (loses >= wins) {
+          resetHistory(session.id);
+          return null;
+        }
+
+        // Nếu thắng nhiều hơn thua, bắt đầu chu kỳ 10 mới.
+        CAUTION.data = [];
+
+        console.log('[CAUTION] 10-session check passed');
+      }
+    }
   }
 
-  // Dự đoán phiên tiếp theo
-  const result = calculateFinal(
-    seq,
-    session._id ?? session.id
-  );
+  // Sau khi chấm dự đoán cũ, thêm phiên mới vào dữ liệu học.
+  // Dữ liệu mới được lưu trước khi tính dự đoán tiếp theo.
+  const currentLearning = readLearning();
+
+  if (!currentLearning.some(h => h.id === session.id)) {
+    currentLearning.push(session);
+
+    currentLearning.sort((a, b) => a.id - b.id);
+
+    const trimmed = currentLearning.slice(-MAX_LEARNING);
+
+    writeLearning(trimmed);
+  }
+
+  const newSeq = readLearning().map(h => h.result);
+
+  const result = calculateFinal(newSeq);
+
+  if (result.final === 'CHƯA ĐỦ DỮ LIỆU') {
+    lastPredict = null;
+
+    console.log(
+      `[LEARNING] ${session.id} | ` +
+      `${newSeq.length} new sessions | Not enough data`
+    );
+
+    return result;
+  }
 
   lastPredict = {
     predict: result.final,
     caution: result.caution,
-    components: result.components
+    components: { ...result.components }
   };
 
   console.log(
     `[PREDICT] ${session.id + 1} | ${result.final} | ` +
-    `Probability: ${(result.probability * 100).toFixed(2)}%`
+    `Probability TAI: ${(result.probability * 100).toFixed(2)}%`
   );
 
   console.log(
@@ -773,11 +953,16 @@ function processLatest(session) {
     `Signal: ${result.reversal.signal}`
   );
 
+  console.log(
+    '[WEIGHTS]',
+    JSON.stringify(bandit.score)
+  );
+
   return result;
 }
 
 // =====================================================
-// 16. DATA SYNCHRONIZATION
+// 19. DATA SYNCHRONIZATION
 // =====================================================
 
 async function syncData() {
@@ -796,67 +981,103 @@ async function syncData() {
       return;
     }
 
-    const fresh = list
+    const normalized = list
       .map(normalizeSession)
-      .filter(s =>
-        Number.isFinite(s.id) &&
-        Number.isFinite(s.sum) &&
-        [0, 1].includes(s.result) &&
-        s.id > lastId
-      )
+      .filter(s => s !== null)
       .sort((a, b) => a.id - b.id);
+
+    if (!normalized.length) return;
+
+    let history = readHistory();
+    let learning = readLearning();
+
+    // Lần đầu cài đặt:
+    // Nếu chưa có lịch sử, chỉ dùng dữ liệu nguồn để
+    // tạo mốc phiên hiện tại và không đưa dữ liệu cũ
+    // vào learning_data.json.
+    if (!bootstrapped) {
+      if (history.length === 0 && learning.length === 0) {
+        history = normalized.slice(-MAX_HISTORY);
+
+        writeHistory(history);
+
+        lastId = Math.max(...normalized.map(s => s.id));
+
+        bootstrapped = true;
+
+        console.log(
+          `[BOOTSTRAP] Saved display history only. ` +
+          `Learning starts after session ${lastId}`
+        );
+
+        return;
+      }
+
+      const historyMax = history.length
+        ? Math.max(...history.map(s => Number(s.id) || 0))
+        : 0;
+
+      const learningMax = learning.length
+        ? Math.max(...learning.map(s => Number(s.id) || 0))
+        : 0;
+
+      lastId = Math.max(lastId, historyMax, learningMax);
+
+      bootstrapped = true;
+    }
+
+    const fresh = normalized.filter(s => s.id > lastId);
 
     if (!fresh.length) return;
 
-    let history = readHistory();
-
-    const knownIds = new Set(
-      history.map(h => h.id)
-    );
-
-    let added = 0;
-
     for (const session of fresh) {
-      if (knownIds.has(session.id)) continue;
-
-      history.push(session);
-
-      knownIds.add(session.id);
-
-      history.sort((a, b) => a.id - b.id);
-
-      history = history.slice(-MAX_HISTORY);
-
-      // Lưu dữ liệu mới trước khi học
-      writeHistory(history);
+      // Cập nhật mốc ID ngay, kể cả khi reset xảy ra.
+      if (session.id <= lastId) continue;
 
       lastId = session.id;
 
-      // Học kết quả vừa nhận và tạo dự đoán mới
-      processLatest(session);
+      // Lưu lịch sử hiển thị.
+      history = readHistory();
 
-      added++;
+      if (!history.some(h => h.id === session.id)) {
+        history.push(session);
+
+        history.sort((a, b) => a.id - b.id);
+
+        history = history.slice(-MAX_HISTORY);
+
+        writeHistory(history);
+      }
+
+      // Chỉ phiên mới được đưa vào learning_data.
+      const result = processLatest(session);
+
+      // Nếu reset được kích hoạt, processLatest trả null.
+      // Không xử lý lại dữ liệu cũ.
+      if (result === null) {
+        history = readHistory();
+      }
+
+      console.log(
+        `[SYNC] Session ${session.id} processed`
+      );
     }
 
-    if (added > 0) {
-      console.log(
-        `[SYNC] +${added} sessions | Total ${history.length}`
-      );
+    const currentLearning = readLearning();
+
+    console.log(
+      `[SYNC] History: ${readHistory().length} | ` +
+      `New learning data: ${currentLearning.length}`
+    );
+
+    if (STATS.total > 0) {
+      const accuracy =
+        STATS.win / STATS.total * 100;
 
       console.log(
-        '[WEIGHTS]',
-        JSON.stringify(bandit.score)
+        `[STATS] ${STATS.win}/${STATS.total} | ` +
+        `${accuracy.toFixed(2)}%`
       );
-
-      if (STATS.total > 0) {
-        const accuracy =
-          STATS.win / STATS.total * 100;
-
-        console.log(
-          `[STATS] ${STATS.win}/${STATS.total} | ` +
-          `${accuracy.toFixed(2)}%`
-        );
-      }
     }
 
   } catch (err) {
@@ -867,7 +1088,7 @@ async function syncData() {
 }
 
 // =====================================================
-// 17. VIETNAM TIME
+// 20. VIETNAM TIME
 // =====================================================
 
 function formatTimeVN() {
@@ -879,11 +1100,12 @@ function formatTimeVN() {
 }
 
 // =====================================================
-// 18. API RESPONSE
+// 21. API RESPONSE
 // =====================================================
 
 function buildResponse() {
   const history = readHistory();
+  const learning = readLearning();
 
   if (!history.length) {
     return {
@@ -895,12 +1117,10 @@ function buildResponse() {
 
   const current = history[history.length - 1];
 
-  const seq = history.map(h => h.result);
+  // Tuyệt đối không dùng history để tính dự đoán.
+  const seq = learning.map(h => h.result);
 
-  const result = calculateFinal(
-    seq,
-    current._id ?? current.id
-  );
+  const result = calculateFinal(seq);
 
   return {
     id: 'noname09',
@@ -919,18 +1139,21 @@ function buildResponse() {
 
     dudoan: result.final === 'TÀI'
       ? 'tai'
-      : 'xiu',
+      : result.final === 'XỈU'
+        ? 'xiu'
+        : 'chua_du_du_lieu',
 
     dotincay: `${Math.round(result.confidence)}%`,
 
-    // Các trường bổ sung, không ảnh hưởng trường cũ
     xacsuatTai: Number(
       (result.probability * 100).toFixed(2)
     ),
 
     phanTichCau: {
       loai: result.reversal.signal,
+
       doDaiCau: result.reversal.streak,
+
       soMauLichSu: result.reversal.support,
 
       xacSuatBeCau: Number(
@@ -942,6 +1165,8 @@ function buildResponse() {
       )
     },
 
+    soPhienHocMoi: seq.length,
+
     canhbao: result.caution,
 
     uptime: formatTimeVN()
@@ -949,7 +1174,7 @@ function buildResponse() {
 }
 
 // =====================================================
-// 19. API ROUTES
+// 22. API ROUTES
 // =====================================================
 
 app.get('/', (req, res) => {
@@ -995,7 +1220,23 @@ app.get('/history', (req, res) => {
   }
 });
 
-// Thống kê mô hình
+// Chỉ hiển thị dữ liệu mới mà thuật toán đã học.
+app.get('/learning', (req, res) => {
+  try {
+    const learning = readLearning();
+
+    res.json({
+      count: learning.length,
+      last20: learning.slice(-20)
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: 'Learning data error'
+    });
+  }
+});
+
+// Thống kê
 app.get('/stats', (req, res) => {
   const accuracy = STATS.total
     ? STATS.win / STATS.total * 100
@@ -1006,45 +1247,64 @@ app.get('/stats', (req, res) => {
     win: STATS.win,
     lose: STATS.lose,
     accuracy: Number(accuracy.toFixed(2)),
+
+    learningSessions: readLearning().length,
+
     weights: bandit.score,
+
     recent: COMPARE,
+
     caution: CAUTION.data
   });
 });
 
 // =====================================================
-// 20. BOOT SERVER
+// 23. BOOT SERVER
 // =====================================================
 
 initDataFile();
 
-// Restore historical data
 {
   const history = readHistory();
+  const learning = readLearning();
 
-  lastId = history.length
-    ? Math.max(...history.map(s => s.id))
+  const historyMax = history.length
+    ? Math.max(...history.map(s => Number(s.id) || 0))
     : 0;
 
-  if (history.length > 0) {
-    const seq = history.map(s => s.result);
+  const learningMax = learning.length
+    ? Math.max(...learning.map(s => Number(s.id) || 0))
+    : 0;
 
-    const current = history[history.length - 1];
+  lastId = Math.max(historyMax, learningMax);
 
-    const result = calculateFinal(
-      seq,
-      current._id ?? current.id
-    );
+  // Khôi phục dự đoán chỉ từ dữ liệu học mới.
+  if (learning.length >= 10) {
+    const seq = learning.map(h => h.result);
 
-    lastPredict = {
-      predict: result.final,
-      caution: result.caution,
-      components: result.components
-    };
+    const result = calculateFinal(seq);
+
+    if (result.final !== 'CHƯA ĐỦ DỮ LIỆU') {
+      lastPredict = {
+        predict: result.final,
+        caution: result.caution,
+        components: { ...result.components }
+      };
+    }
   }
 
+  bootstrapped = history.length > 0 || learning.length > 0;
+
   console.log(
-    `[BOOT] Restored ${history.length} sessions`
+    `[BOOT] History: ${history.length}`
+  );
+
+  console.log(
+    `[BOOT] New learning sessions: ${learning.length}`
+  );
+
+  console.log(
+    `[BOOT] Last session ID: ${lastId}`
   );
 }
 
@@ -1066,12 +1326,11 @@ app.listen(PORT, () => {
   console.log(`[BOOT] Port ${PORT}`);
   console.log(`[BOOT] Time ${formatTimeVN()}`);
 
-  console.log(
-    '[BOOT] Bayesian + Markov + Pattern + Reversal + Bandit'
-  );
+  console.log('[BOOT] Bayesian + Markov + Pattern + Reversal + Bandit');
 
-  console.log('[BOOT] MD5 removed');
+  console.log('[BOOT] Old history excluded from prediction');
+  console.log('[BOOT] Learning uses learning_data.json only');
+  console.log('[BOOT] 10 caution-session reset enabled');
+  console.log('[BOOT] MD5 removed from algorithm');
   console.log('[BOOT] Random disabled');
-  console.log('[BOOT] Reversal learning enabled');
-  console.log('[BOOT] Persistent model weights enabled');
 });
