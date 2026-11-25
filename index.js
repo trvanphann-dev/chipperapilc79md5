@@ -1,83 +1,100 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const app = express();
+
+const DATA_FILE = path.join(__dirname, 'lichsulc79.json');
+const LEGACY_FILE = path.join(__dirname, 'lichsulc79md5.json');
+
+const SOURCE_API = process.env.SOURCE_API ||
+  'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
+
+const PORT = process.env.PORT || 3000;
+const POLL_INTERVAL = 15000;
+
 app.use(express.json());
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// CẤU HÌNH
-const DATA_FILE = path.join(__dirname, 'lichsulc79.json'); // Đổi tên file theo yêu cầu
-const SOURCE_API = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0';
-const POLL_INTERVAL = 15000;
-const MAX_HISTORY = 1000;
-const PORT = process.env.PORT || 3000;
+// Chuẩn hóa dữ liệu phiên
 
-// =====================================================
-// 1. QUẢN LÝ DỮ LIỆU
-// =====================================================
+function integer(value) {
+  const isNumericString =
+    typeof value === 'string' && /^\d+$/.test(value.trim());
 
-function initDataFile() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, '[]', 'utf8');
-    console.log('[INIT] Đã tạo file lịch sử mới:', DATA_FILE);
+  if (typeof value !== 'number' && !isNumericString) return null;
+
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function label(value) {
+  const s = String(value ?? '')
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase();
+
+  if (s === 'TAI' || s === 'BIG') return 1;
+  if (s === 'XIU' || s === 'SMALL') return 0;
+  return null;
+}
+
+function normalize(raw, fromDisk = false) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const id = integer(raw.id ?? raw.session ?? raw.issue);
+  if (id === null || id < 1 || id >= Number.MAX_SAFE_INTEGER) {
+    return null;
   }
-}
 
-function readHistory() {
-  try {
-    const data = fs.readFileSync(DATA_FILE, 'utf8');
-    return JSON.parse(data || '[]');
-  } catch (err) {
-    console.error('[READ ERROR]', err.message);
-    return [];
+  const faces = raw.dices ?? raw.dice ?? raw.result;
+  let dices = [];
+
+  if (Array.isArray(faces) && faces.length === 3) {
+    const values = faces.map(integer);
+    if (values.every(v => v >= 1 && v <= 6)) {
+      dices = values;
+    }
   }
-}
 
-function writeHistory(arr) {
-  const tempFile = DATA_FILE + '.tmp';
-  fs.writeFileSync(tempFile, JSON.stringify(arr, null, 2), 'utf8');
-  fs.renameSync(tempFile, DATA_FILE);
-}
+  const total = integer(raw.sum);
+  let sum = null;
 
-// =====================================================
-// 2. LẤY DỮ LIỆU TỪ API
-// =====================================================
+  if (dices.length === 3) {
+    sum = dices.reduce((a, b) => a + b, 0);
+  } else if (total >= 3 && total <= 18) {
+    sum = total;
+  }
 
-async function fetchSource() {
-  const res = await fetch(SOURCE_API, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Accept': 'application/json',
-      'Referer': 'https://tele68.com/'
-    },
-    signal: AbortSignal.timeout(10000)
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.json();
-}
+  let result =
+    label(raw.resultTruyenThong) ??
+    label(raw.bigSmall) ??
+    label(raw.result);
 
-function normalizeSession(raw) {
-  const id = raw.id ?? raw.session ?? raw.issue;
-  const rawDices = raw.dices ?? raw.dice ?? (Array.isArray(raw.result) ? raw.result : []);
-  const dices = Array.isArray(rawDices) ? rawDices.map(Number) : [];
-  const sum = dices.length ? dices.reduce((a, b) => a + b, 0) : Number(raw.sum ?? 0);
-  
-  let result = sum >= 11 ? 1 : 0; // 1: Tài, 0: Xỉu
-  // Nếu API trả về chuỗi kết quả rõ ràng, ưu tiên dùng nó
-  const sourceResult = String(raw.resultTruyenThong ?? raw.bigSmall ?? '').trim().toUpperCase();
-  if (['TAI', 'TÀI', 'BIG'].includes(sourceResult)) result = 1;
-  if (['XIU', 'XỈU', 'SMALL'].includes(sourceResult)) result = 0;
+  // Trong file lịch sử, 1 là Tài và 0 là Xỉu.
+  if (fromDisk && (raw.result === 0 || raw.result === 1)) {
+    result = raw.result;
+  }
+
+  // Giữ cách phân loại theo tổng của API cũ khi thiếu nhãn.
+  if (result === null && sum !== null) {
+    result = Number(sum >= 11);
+  }
+
+  // Phiên chưa có kết quả sẽ được xét lại trong lần đồng bộ sau.
+  if (result === null) return null;
 
   return {
-    id: Number(id),
+    id,
     _id: String(raw._id ?? id),
     dices,
     sum,
@@ -85,306 +102,276 @@ function normalizeSession(raw) {
   };
 }
 
-// =====================================================
-// 3. LÕI THUẬT TOÁN AI (ENSEMBLE MACHINE LEARNING)
-// =====================================================
+// Mô hình dự đoán xác định, không dùng random hoặc MD5
 
-class AIPredictor {
+class Predictor {
   constructor() {
-    this.learningRate = 0.05; // Tốc độ học
-    this.weights = {
-      markov: 1.5,
-      ngram: 1.2,
-      logistic: 1.0,
-      streak: 0.8,
-      noise: -1.0
-    };
-    this.memory = new Map(); // Bộ nhớ đệm để tăng tốc
+    // Bậc -1 là mốc 50/50. Bậc 0 học tần suất chung.
+    // Bậc 1–3 học tần suất sau 1–3 kết quả liên tiếp.
+    // Ban đầu, mốc 50/50 nhận một nửa tổng trọng số.
+    this.models = [-1, 0, 1, 2, 3].map(order => ({
+      order,
+      counts: new Map(),
+      logWeight: order < 0 ? Math.log(4) : 0
+    }));
+
+    this.tail = '';
+    this.lastId = null;
+    this.scored = 0;
+    this.hits = 0;
+    this.brier = 0;
   }
 
-  // --- THUẬT TOÁN 1: MARKOV CHAIN BẬC 2 (TÌM QUY LUẬT CHUYỂN ĐỔI) ---
-  markovChain(seq) {
-    if (seq.length < 10) return 0.5;
-    
-    let transitions = { '00': {0: 0, 1: 0}, '01': {0: 0, 1: 0}, '10': {0: 0, 1: 0}, '11': {0: 0, 1: 0} };
-    
-    for (let i = 0; i < seq.length - 2; i++) {
-      const state = `${seq[i]}${seq[i+1]}`;
-      const next = seq[i+2];
-      transitions[state][next]++;
+  context(order) {
+    if (order < 0 || this.tail.length < order) return null;
+    return order === 0 ? '' : this.tail.slice(-order);
+  }
+
+  estimate() {
+    let weighted = 0;
+    let totalWeight = 0;
+
+    const parts = this.models.map(model => {
+      const key = this.context(model.order);
+      const counts = model.counts.get(key) ?? [0, 0];
+
+      // Làm trơn để một mẫu ngắn chưa thể cho xác suất 0% hoặc 100%.
+      const p = (counts[1] + 0.5) / (counts[0] + counts[1] + 1);
+      const weight = Math.exp(model.logWeight);
+
+      weighted += weight * p;
+      totalWeight += weight;
+
+      return { model, key, p };
+    });
+
+    return { p: weighted / totalWeight, parts };
+  }
+
+  observe(row) {
+    const consecutive =
+      this.lastId !== null && row.id === this.lastId + 1;
+
+    // Khi thiếu phiên, bắt đầu lại chuỗi ngữ cảnh tại vị trí mới.
+    if (!consecutive) this.tail = '';
+
+    // Lấy dự đoán trước khi học kết quả thật của phiên này.
+    const { p, parts } = this.estimate();
+    const y = row.result;
+
+    if (consecutive) {
+      this.scored++;
+      if ((p >= 0.5) === (y === 1)) this.hits++;
+      this.brier += (p - y) ** 2;
     }
 
-    const lastState = `${seq[seq.length - 2]}${seq[seq.length - 1]}`;
-    const counts = transitions[lastState];
-    const total = counts[0] + counts[1];
-    
-    if (total === 0) return 0.5; // Không có dữ liệu quá khứ
-    return counts[1] / total; // Xác suất ra Tài (1)
+    for (const { model, key, p: q } of parts) {
+      // Trọng số thay đổi theo xác suất từng mô hình đã gán
+      // cho kết quả thực tế trước khi nhìn thấy kết quả đó.
+      model.logWeight += y ? Math.log(q) : Math.log1p(-q);
+
+      if (key === null) continue;
+
+      const counts = model.counts.get(key) ?? [0, 0];
+      counts[y]++;
+      model.counts.set(key, counts);
+    }
+
+    // Giữ phép tính trọng số ổn định khi lịch sử dài.
+    const peak = Math.max(...this.models.map(m => m.logWeight));
+    for (const model of this.models) {
+      model.logWeight -= peak;
+    }
+
+    this.tail = (this.tail + y).slice(-3);
+    this.lastId = row.id;
+  }
+}
+
+// Lưu lịch sử và khôi phục khi khởi động
+
+function save(rows) {
+  const temp = DATA_FILE + '.' + process.pid + '.tmp';
+  fs.writeFileSync(temp, JSON.stringify(rows), 'utf8');
+  fs.renameSync(temp, DATA_FILE);
+}
+
+function load() {
+  const migrate = !fs.existsSync(DATA_FILE);
+
+  if (migrate && !fs.existsSync(LEGACY_FILE)) {
+    save([]);
+    return [];
   }
 
-  // --- THUẬT TOÁN 2: N-GRAM PATTERN MATCHING (TÌM CHUỖI LẶP LẠI) ---
-  nGramPattern(seq) {
-    if (seq.length < 15) return 0.5;
-    
-    const n = 5; // Tìm chuỗi 5 phiên gần nhất
-    const currentPattern = seq.slice(-n).join('');
-    let matches = [];
+  const file = migrate ? LEGACY_FILE : DATA_FILE;
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
 
-    // Quét toàn bộ lịch sử để tìm pattern này
-    for (let i = 0; i < seq.length - n - 1; i++) {
-      const pattern = seq.slice(i, i + n).join('');
-      if (pattern === currentPattern) {
-        matches.push(seq[i + n]); // Kết quả ngay sau pattern đó
+  if (!Array.isArray(raw)) {
+    throw new Error('Lịch sử phải là mảng JSON: ' + file);
+  }
+
+  const byId = new Map();
+  let skipped = 0;
+
+  for (const item of raw) {
+    const row = normalize(item, true);
+
+    // Mã cũ có thể ghi nhầm phiên thiếu dữ liệu thành Xỉu, tổng 0.
+    if (!row || (migrate && row.sum === null)) {
+      if (!migrate) {
+        throw new Error('Bản ghi không hợp lệ trong ' + file);
+      }
+      skipped++;
+      continue;
+    }
+
+    byId.set(row.id, row);
+  }
+
+  const rows = [...byId.values()].sort((a, b) => a.id - b.id);
+
+  if (migrate) {
+    save(rows);
+    console.log(
+      '[MIGRATE]', rows.length, 'phiên hợp lệ, bỏ qua',
+      skipped, 'bản ghi thiếu dữ liệu'
+    );
+  }
+
+  return rows;
+}
+
+let history = load();
+const known = new Set(history.map(row => row.id));
+
+let model = new Predictor();
+for (const row of history) {
+  model.observe(row);
+}
+
+// Đồng bộ nguồn API
+
+async function sync() {
+  try {
+    const res = await fetch(SOURCE_API, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+        Referer: 'https://tele68.com/'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const body = await res.json();
+    const list = [
+      body,
+      body?.data,
+      body?.sessions,
+      body?.list,
+      body?.data?.sessions,
+      body?.data?.list
+    ].find(Array.isArray);
+
+    if (!list) throw new Error('API chưa trả về danh sách phiên');
+
+    const batch = new Map();
+
+    for (const raw of list) {
+      const row = normalize(raw);
+
+      if (row && !known.has(row.id) && !batch.has(row.id)) {
+        batch.set(row.id, row);
       }
     }
 
-    if (matches.length === 0) return 0.5; // Chưa từng gặp pattern này
-    
-    // Tính xác suất Tài dựa trên các lần pattern xuất hiện trong quá khứ
-    const taiCount = matches.filter(r => r === 1).length;
-    return taiCount / matches.length;
-  }
+    if (batch.size === 0) return;
 
-  // --- THUẬT TOÁN 3: ONLINE LOGISTIC REGRESSION (TỰ HỌC TRỌNG SỐ) ---
-  logisticRegression(seq, currentSession) {
-    // Các đặc trưng (features): Tổng điểm, Chẵn/Lẻ, Số lượng Tài gần đây
-    let sumFeature = (currentSession.sum - 10) / 8; // Chuẩn hóa tổng điểm về khoảng [-1, 1]
-    let parityFeature = currentSession.sum % 2 === 0 ? 1 : -1;
-    let recentTai = seq.slice(-5).filter(x => x === 1).length / 5; // Tỷ lệ Tài 5 phiên gần nhất
-    
-    // Trọng số tự học (bắt đầu từ 0)
-    let wSum = 0.1, wParity = 0.1, wRecent = 0.3, bias = 0;
-    
-    // Z = w1*x1 + w2*x2 + w3*x3 + bias
-    let z = wSum * sumFeature + wParity * parityFeature + wRecent * (recentTai - 0.5) + bias;
-    
-    // Hàm Sigmoid
-    return 1 / (1 + Math.exp(-z));
-  }
+    const added = [...batch.values()].sort((a, b) => a.id - b.id);
+    const backfill =
+      history.length > 0 && added[0].id < history.at(-1).id;
 
-  // --- THUẬT TOÁN 4: PHÂN TÍCH ĐỘ DÀI CẦU (STREAK) ---
-  streakAnalysis(seq) {
-    if (seq.length < 3) return 0.5;
-    const last = seq[seq.length - 1];
-    let streak = 1;
-    for (let i = seq.length - 2; i >= 0; i--) {
-      if (seq[i] === last) streak++;
-      else break;
-    }
-    
-    // Cầu bệt càng dài, xác suất gãy càng cao (hoặc tiếp tục tùy quy luật)
-    // Ở đây ta ưu tiên logic: Cầu dài >= 5 thường sẽ gãy (đổi cầu)
-    if (streak >= 5) return last === 1 ? 0.2 : 0.8; // Đảo cầu
-    if (streak === 4) return last === 1 ? 0.4 : 0.6;
-    return 0.5; // Các trường hợp khác không có tín hiệu rõ ràng
-  }
+    const next = history.concat(added);
+    if (backfill) next.sort((a, b) => a.id - b.id);
 
-  // --- THUẬT TOÁN 5: NHIỄU & ENTROPY (CHAOS DETECTOR) ---
-  chaosDetector(seq) {
-    if (seq.length < 20) return 0;
-    const last20 = seq.slice(-20);
-    const taiCount = last20.filter(x => x === 1).length;
-    const pTai = taiCount / 20;
-    
-    // Tính độ hỗn loạn (Entropy)
-    if (pTai === 0 || pTai === 1) return 0;
-    const entropy = -(pTai * Math.log2(pTai) + (1 - pTai) * Math.log2(1 - pTai));
-    
-    // Nếu entropy quá cao (>0.95), dữ liệu đang nhiễu loạn hoàn toàn, ko nên dự đoán
-    return entropy > 0.95 ? -1 : 0; 
-  }
+    // Nếu ghi lỗi, giữ trạng thái cũ để lần đồng bộ sau thử lại.
+    save(next);
 
-  // --- TỔNG HỢP (ENSEMBLE) ---
-  predict(seq, currentSession) {
-    const pMarkov = this.markovChain(seq);
-    const pNGram = this.nGramPattern(seq);
-    const pLogistic = this.logisticRegression(seq, currentSession);
-    const pStreak = this.streakAnalysis(seq);
-    const chaosPenalty = this.chaosDetector(seq);
+    // Khi có phiên đến muộn, phát lại lịch sử theo đúng thứ tự.
+    if (backfill) model = new Predictor();
 
-    // Trọng số tổng hợp
-    let finalScore = 
-      (pMarkov * this.weights.markov) +
-      (pNGram * this.weights.ngram) +
-      (pLogistic * this.weights.logistic) +
-      (pStreak * this.weights.streak);
-
-    // Nếu phát hiện nhiễu loạn (chaos), kéo xác suất về 0.5 (Không dự đoán)
-    if (chaosPenalty === -1) {
-      finalScore = 0.5; 
+    for (const row of backfill ? next : added) {
+      model.observe(row);
     }
 
-    // Chuẩn hóa lại điểm số (vì có nhiều weights)
-    const totalWeight = this.weights.markov + this.weights.ngram + this.weights.logistic + this.weights.streak;
-    const finalProbability = finalScore / totalWeight;
-
-    // Chuyển đổi xác suất sang % và nhãn
-    const isTai = finalProbability >= 0.5;
-    const confidence = Math.abs(finalProbability - 0.5) * 2 * 100; // Khoảng 0-100%
-
-    return {
-      prediction: isTai ? 'TÀI' : 'XỈU',
-      probability: finalProbability,
-      confidence: Math.round(confidence * 100) / 100
-    };
-  }
-
-  // Hàm tự học (Online Learning): Cập nhật trọng số dựa trên kết quả thực tế
-  updateWeights(prediction, actualResult) {
-    const isWin = (prediction.prediction === 'TÀI' && actualResult === 1) || 
-                  (prediction.prediction === 'XỈU' && actualResult === 0);
-    
-    // Nếu thắng, tăng nhẹ trọng số của các mô hình đã đóng góp
-    // Nếu thua, giảm nhẹ
-    const delta = isWin ? 0.02 : -0.02;
-    
-    // Giới hạn trọng số trong khoảng [0.1, 3.0] để tránh bị lệch
-    this.weights.markov = Math.max(0.1, Math.min(3.0, this.weights.markov + delta));
-    this.weights.ngram = Math.max(0.1, Math.min(3.0, this.weights.ngram + delta));
-    this.weights.logistic = Math.max(0.1, Math.min(3.0, this.weights.logistic + delta));
-    this.weights.streak = Math.max(0.1, Math.min(3.0, this.weights.streak + delta));
-  }
-}
-
-// Khởi tạo AI
-const ai = new AIPredictor();
-let lastPrediction = null;
-let lastId = 0;
-const STATS = { total: 0, win: 0, lose: 0 };
-
-// =====================================================
-// 4. XỬ LÝ DỮ LIỆU MỚI
-// =====================================================
-
-function processLatestSession(session) {
-  const history = readHistory();
-  const seq = history.map(h => h.result);
-  
-  // 1. Chấm điểm dự đoán trước đó (nếu có)
-  if (lastPrediction) {
-    STATS.total++;
-    const isWin = (lastPrediction.prediction === 'TÀI' && session.result === 1) || 
-                  (lastPrediction.prediction === 'XỈU' && session.result === 0);
-    
-    if (isWin) STATS.win++;
-    else STATS.lose++;
-
-    // Cho AI tự học từ sai lầm
-    ai.updateWeights(lastPrediction, session.result);
-    
-    console.log(`[KẾT QUẢ] Phiên ${session.id}: ${session.result === 1 ? 'TÀI' : 'XỈU'} | Dự đoán trước: ${lastPrediction.prediction} | ${isWin ? 'THẮNG' : 'THUA'}`);
-  }
-
-  // 2. Dự đoán cho phiên tiếp theo
-  const prediction = ai.predict(seq, session);
-  lastPrediction = { ...prediction, sessionId: session.id + 1 };
-
-  console.log(`[DỰ ĐOÁN] Phiên ${session.id + 1}: ${prediction.prediction} (${prediction.confidence}%)`);
-}
-
-// =====================================================
-// 5. ĐỒNG BỘ DỮ LIỆU
-// =====================================================
-
-let syncInProgress = false;
-
-async function syncData() {
-  if (syncInProgress) return;
-  syncInProgress = true;
-  try {
-    const raw = await fetchSource();
-    const list = Array.isArray(raw) ? raw : (raw.data ?? raw.sessions ?? raw.list ?? []);
-    if (!list.length) return;
-
-    const fresh = list
-      .map(normalizeSession)
-      .filter(s => Number.isFinite(s.id) && Number.isFinite(s.sum) && s.id > lastId)
-      .sort((a, b) => a.id - b.id);
-
-    if (!fresh.length) return;
-
-    const history = readHistory();
-    const knownIds = new Set(history.map(h => h.id));
-    const added = [];
-
-    for (const s of fresh) {
-      if (knownIds.has(s.id)) continue;
-      history.push(s);
-      knownIds.add(s.id);
-      added.push(s);
-    }
-
-    lastId = fresh[fresh.length - 1].id;
-
-    if (added.length > 0) {
-      history.sort((a, b) => a.id - b.id);
-      writeHistory(history.slice(-MAX_HISTORY)); // Lưu tối đa 1000 phiên để tránh file quá lớn
-      console.log(`[SYNC] Đã thêm ${added.length} phiên mới. Tổng: ${history.length}`);
-      
-      // Xử lý phiên mới nhất
-      processLatestSession(added[added.length - 1]);
-    }
+    for (const row of added) known.add(row.id);
+    history = next;
   } catch (err) {
-    console.error('[SYNC ERROR]', err.message);
-  } finally {
-    syncInProgress = false;
+    console.error('[SYNC]', err.message);
   }
 }
 
-// =====================================================
-// 6. API SERVER
-// =====================================================
+// API trả kết quả
 
-function formatTimeVN() {
-  const now = new Date(Date.now() + 7 * 3600 * 1000);
-  return now.toISOString().replace('Z', '+07:00');
-}
+function respond(req, res) {
+  const uptime = new Date(Date.now() + 7 * 3600000)
+    .toISOString()
+    .replace('Z', '+07:00');
 
-app.get('/', (req, res) => {
-  const history = readHistory();
-  if (history.length === 0) {
-    return res.json({ error: 'Đang chờ dữ liệu...' });
+  const row = history.at(-1);
+
+  if (!row) {
+    return res.json({
+      id: 'noname09',
+      error: 'Chưa có dữ liệu, chờ sync',
+      uptime
+    });
   }
 
-  const current = history[history.length - 1];
-  const pred = ai.predict(history.map(h => h.result), current);
+  const { p } = model.estimate();
+  const n = model.scored;
 
   res.json({
     id: 'noname09',
-    phienhientai: current.id,
-    ketqua: current.result === 1 ? 'tai' : 'xiu',
-    xucxac: current.dices,
-    tong: current.sum,
-    dudoanphien: current.id + 1,
-    dudoan: pred.prediction === 'TÀI' ? 'tai' : 'xiu',
-    dotincay: `${pred.confidence}%`,
-    thongke: STATS,
-    uptime: formatTimeVN()
+    phienhientai: row.id,
+    ketqua: row.result ? 'tai' : 'xiu',
+    xucxac: row.dices,
+    tong: row.sum,
+    dudoanphien: row.id + 1,
+    dudoan: p >= 0.5 ? 'tai' : 'xiu',
+    dotincay: (100 * Math.max(p, 1 - p)).toFixed(2) + '%',
+    kiemtra_lichsu: {
+      so_phien: n,
+      so_dung: model.hits,
+      ty_le_dung: n ? (100 * model.hits / n).toFixed(2) + '%' : null,
+      brier: n ? Number((model.brier / n).toFixed(5)) : null
+    },
+    uptime
   });
+}
+
+app.get(['/', '/predict'], respond);
+
+app.get('/ping', (req, res) => {
+  res.send('pong');
 });
 
 app.get('/history', (req, res) => {
-  const h = readHistory();
-  res.json({ count: h.length, last20: h.slice(-20) });
+  res.json({
+    count: history.length,
+    last20: history.slice(-20)
+  });
 });
 
-// =====================================================
-// 7. KHỞI ĐỘNG
-// =====================================================
-
-initDataFile();
-
-// Khôi phục trạng thái
-{
-  const h = readHistory();
-  lastId = h.length ? h[h.length - 1].id : 0;
-  // Có thể nạp lại lịch sử để AI học lại từ đầu nếu cần
+// Chờ lần đồng bộ hiện tại kết thúc rồi mới hẹn lần tiếp theo.
+async function poll() {
+  await sync();
+  setTimeout(poll, POLL_INTERVAL).unref();
 }
 
-syncData();
-setInterval(syncData, POLL_INTERVAL);
-
 app.listen(PORT, () => {
-  console.log(`[BOOT] Server chạy tại port ${PORT} - ${formatTimeVN()}`);
-  console.log('[BOOT] Hệ thống AI Ensemble (Markov + N-Gram + Logistic + Streak) đã sẵn sàng!');
+  console.log('[BOOT] Port', PORT, '| Đã nạp', history.length, 'phiên');
+  void poll();
 });
